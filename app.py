@@ -382,7 +382,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["🏠 Dashboard", "🔍 Scanner", "📊 Rankings", "🔎 Company Lookup",
-         "🏛 Valuation Engine", "🚨 Qualitative Alerts",
+         "🏛 Valuation Engine", "🚨 Qualitative Alerts", "📄 Company Dossier",
          "📋 Watchlist", "⚡ Swing Trades", "📅 Quarterly Review"],
         label_visibility="collapsed"
     )
@@ -968,7 +968,421 @@ elif page == "📅 Quarterly Review":
         else:
             st.warning("Some checklist items are incomplete. Review them before finalising.")
 
-# This line intentionally left blank
+# ═════════════════════════════════════════════
+# COMPANY DOSSIER PDF GENERATOR
+# Professional 2-page institutional dossier
+# ═════════════════════════════════════════════
+
+def _format_number(v, fmt=".0f"):
+    """Format large numbers for readability."""
+    if not v or v == 0: return "—"
+    if abs(v) >= 1e9: return f"${v/1e9:.1f}B"
+    if abs(v) >= 1e6: return f"${v/1e6:.1f}M"
+    if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
+    return f"${v:,.0f}"
+
+def _pct(v):
+    """Format as percentage."""
+    if v is None or v == "N/A": return "—"
+    return f"{float(v)*100:.1f}%" if isinstance(v, (int, float)) else "—"
+
+def _tbl_rows(d, keys, years=5):
+    """Extract historical data for a table row."""
+    h = d.get(keys[0], [])
+    if not isinstance(h, list): h = [h] if h else []
+    h = list(reversed(h))[:years]
+    # Pad with empty if less than years available
+    while len(h) < years: h.insert(0, {})
+    return h
+
+def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, lynch_cat, 
+                         lynch_note, lynch_peg, moat_rating, moat_score, 
+                         cio_recommendation, investment_edge, risks_text):
+    """Generate a professional 2-page MCIS Company Dossier PDF."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch, cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from datetime import datetime
+    
+    output_path = f"/tmp/{ticker}_dossier.pdf"
+    doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch,
+                            leftMargin=0.6*inch, rightMargin=0.6*inch)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    t_header = ParagraphStyle('CustomHeader', parent=styles['Heading1'],
+                              fontSize=16, textColor=colors.HexColor('#1a3c5e'),
+                              spaceAfter=2, fontName='Helvetica-Bold')
+    t_subhdr = ParagraphStyle('CustomSubHeader', parent=styles['Heading2'],
+                              fontSize=11, textColor=colors.HexColor('#1a3c5e'),
+                              spaceAfter=6, spaceBefore=6, fontName='Helvetica-Bold')
+    t_normal = ParagraphStyle('CustomNormal', parent=styles['Normal'],
+                              fontSize=9, alignment=TA_LEFT, spaceAfter=3)
+    t_small  = ParagraphStyle('CustomSmall', parent=styles['Normal'],
+                              fontSize=8, textColor=colors.HexColor('#666666'), spaceAfter=2)
+    
+    # ═══════════════════════════════════════════
+    # PAGE 1 — FINANCIAL SNAPSHOT
+    # ═══════════════════════════════════════════
+    
+    # Header
+    story.append(Paragraph(f"<b>{ticker} — {d.get('name','')}</b>", t_header))
+    story.append(Paragraph(f"{d.get('sector','')} | {d.get('industry','')} | "
+                           f"Price ${v['price']:,.2f} | Market Cap {fmt_mktcap(v['mktcap'])}",
+                           t_small))
+    story.append(Spacer(1, 0.15*inch))
+    
+    # 1. Income Statement (5 years)
+    story.append(Paragraph("INCOME STATEMENT (5 YEARS)", t_subhdr))
+    inc = _tbl_rows(d, ['income6', 'income'], years=5)
+    inc_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    for label, key, fmt_fn in [
+        ("Revenue", "revenue", lambda x: _format_number(x)),
+        ("Revenue Growth %", "__rev_cagr__", lambda x: "—"),
+        ("Gross Profit", "grossProfit", lambda x: _format_number(x)),
+        ("Gross Margin %", "grossProfitMargin", lambda x: _pct(x)),
+        ("Operating Income", "operatingIncome", lambda x: _format_number(x)),
+        ("Operating Margin %", "__op_margin__", lambda x: "—"),
+        ("Net Income", "netIncome", lambda x: _format_number(x)),
+        ("Net Margin %", "__net_margin__", lambda x: "—"),
+        ("EPS", "eps", lambda x: f"${float(x):.2f}" if x else "—"),
+    ]:
+        row = [label]
+        for i, yr in enumerate(inc):
+            if key.startswith("__"):
+                if key == "__rev_cagr__" and i == 4 and v.get("rev_cagr"):
+                    row.append(f"{v['rev_cagr']*100:.1f}%")
+                else: row.append("—")
+            else:
+                val = yr.get(key)
+                row.append(fmt_fn(val) if val else "—")
+        inc_rows.append(row)
+    
+    inc_tbl = Table(inc_rows, colWidths=[1.3*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch])
+    inc_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 4),
+        ('TOPPADDING', (0, 0), (-1, 0), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+    ]))
+    story.append(inc_tbl)
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 2. Cash Flow Statement (5 years)
+    story.append(Paragraph("CASH FLOW STATEMENT (5 YEARS)", t_subhdr))
+    cf = _tbl_rows(d, ['cashflow6', 'cashflow'], years=5)
+    cf_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    for label, key in [
+        ("Operating Cash Flow", "operatingCashFlow"),
+        ("Capital Expenditure", "capitalExpenditure"),
+        ("Free Cash Flow", "freeCashFlow"),
+        ("FCF Margin %", "__fcf_margin__"),
+    ]:
+        row = [label]
+        for i, yr in enumerate(cf):
+            if key == "__fcf_margin__":
+                if v.get("rev_hist") and v.get("fcf_hist") and i < len(v["fcf_hist"]):
+                    fm = v["fcf_hist"][i] / v["rev_hist"][i] * 100 if v["rev_hist"][i] > 0 else 0
+                    row.append(f"{fm:.1f}%")
+                else: row.append("—")
+            else:
+                val = yr.get(key)
+                row.append(_format_number(val) if val else "—")
+        cf_rows.append(row)
+    
+    cf_tbl = Table(cf_rows, colWidths=[1.3*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch])
+    cf_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 4),
+        ('TOPPADDING', (0, 0), (-1, 0), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+    ]))
+    story.append(cf_tbl)
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 3. Balance Sheet (5 years)
+    story.append(Paragraph("BALANCE SHEET & CAPITAL STRUCTURE (5 YEARS)", t_subhdr))
+    bal = _tbl_rows(d, ['balance'], years=5)
+    bal_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    for label, key in [
+        ("Cash & Equivalents", "cashAndShortTermInvestments"),
+        ("Total Debt", "totalDebt"),
+        ("Net Debt", "__net_debt__"),
+        ("Shareholders' Equity", "totalStockholdersEquity"),
+        ("Shares Outstanding (M)", "commonStockSharesIssued"),
+    ]:
+        row = [label]
+        for i, yr in enumerate(bal):
+            if key == "__net_debt__":
+                row.append(_format_number(v.get("net_debt")) if i == 0 else "—")
+            elif key == "commonStockSharesIssued":
+                val = yr.get(key)
+                row.append(f"{float(val)/1e6:.0f}M" if val else "—")
+            else:
+                val = yr.get(key)
+                row.append(_format_number(val) if val else "—")
+        bal_rows.append(row)
+    
+    bal_tbl = Table(bal_rows, colWidths=[1.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch])
+    bal_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 4),
+        ('TOPPADDING', (0, 0), (-1, 0), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+    ]))
+    story.append(bal_tbl)
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 4. Key Ratios
+    story.append(Paragraph("KEY FINANCIAL RATIOS", t_subhdr))
+    m = result.get("metrics", {})
+    ratio_rows = [
+        ["ROIC", f"{m.get('roic','N/A')}%"],
+        ["Gross Margin", f"{m.get('gm','N/A')}%"],
+        ["Net Margin", f"{m.get('nm','N/A')}%" if 'nm' in m else "—"],
+        ["FCF Margin", f"{m.get('fcf_margin','N/A')}%"],
+        ["Debt/EBITDA", f"{m.get('debt_ebitda','N/A')}x"],
+        ["P/E Ratio", f"{m.get('pe','N/A')}x"],
+        ["EV/EBITDA", f"{m.get('ev_ebitda','N/A')}x"],
+    ]
+    ratio_tbl = Table(ratio_rows, colWidths=[2*inch, 2*inch])
+    ratio_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f0f0')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(ratio_tbl)
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 5. Price Section
+    story.append(Paragraph("PRICE & VALUATION METRICS", t_subhdr))
+    price_info = [
+        ["Current Price", f"${v['price']:,.2f}"],
+        ["Market Cap", fmt_mktcap(v['mktcap'])],
+        ["MCIS Score", f"{result['score']}/100"],
+        ["MCIS Verdict", result['verdict']],
+        ["Halal Status", result.get('halal','?')],
+    ]
+    price_tbl = Table(price_info, colWidths=[2*inch, 2*inch])
+    price_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f0f0')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(price_tbl)
+    
+    # Page break
+    story.append(PageBreak())
+    
+    # ═══════════════════════════════════════════
+    # PAGE 2 — INVESTMENT ANALYSIS (CIO PAGE)
+    # ═══════════════════════════════════════════
+    
+    story.append(Paragraph(f"<b>INVESTMENT ANALYSIS — {ticker}</b>", t_header))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 1. Valuation
+    story.append(Paragraph("VALUATION FRAMEWORK", t_subhdr))
+    val_data = [
+        ["DCF (Base Case)", "See Valuation Engine for full model"],
+        ["Reverse DCF", "Market growth expectations embedded in price"],
+        ["Historical P/E", f"{m.get('pe','N/A')}x"],
+        ["Historical EV/EBITDA", f"{m.get('ev_ebitda','N/A')}x"],
+        ["PEG Ratio", f"{lynch_peg:.2f}" if lynch_peg else "N/A"],
+        ["Margin of Safety", "See Valuation Engine"],
+    ]
+    val_tbl = Table(val_data, colWidths=[2*inch, 2.5*inch])
+    val_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f0f0')),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(val_tbl)
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 2. Buffett Quality Test
+    story.append(Paragraph("BUFFETT QUALITY TEST (10 CHECKS)", t_subhdr))
+    story.append(Paragraph(f"<b>Score: {buffett_score}/10</b> | " +
+                           ("WONDERFUL COMPANY" if buffett_score >= 8 else
+                            "GOOD COMPANY" if buffett_score >= 6 else
+                            "AVERAGE" if buffett_score >= 4 else "AVOID"),
+                           t_normal))
+    for c in buffett_checks:
+        symbol = "✓" if c["ok"] else "✗"
+        story.append(Paragraph(f"<b>{symbol} {c['check']}</b> — {c['detail']}", t_small))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 3. Peter Lynch Classification
+    story.append(Paragraph("PETER LYNCH CLASSIFICATION", t_subhdr))
+    story.append(Paragraph(f"<b>{lynch_cat}</b>", t_normal))
+    story.append(Paragraph(lynch_note, t_small))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 4. Moat Assessment
+    story.append(Paragraph("COMPETITIVE MOAT", t_subhdr))
+    story.append(Paragraph(f"<b>{moat_rating} ({moat_score}/10)</b>", t_normal))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 5. Risks (from input)
+    story.append(Paragraph("MATERIAL RISKS", t_subhdr))
+    if risks_text:
+        for line in risks_text.split("\n")[:5]:
+            if line.strip():
+                story.append(Paragraph(f"• {line.strip()}", t_small))
+    else:
+        story.append(Paragraph("• No risks documented", t_small))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 6. Investment Edge
+    story.append(Paragraph("INVESTMENT EDGE", t_subhdr))
+    if investment_edge:
+        story.append(Paragraph(investment_edge, t_small))
+    else:
+        story.append(Paragraph("[Investment edge not yet documented]", t_small))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 7. CIO Recommendation
+    story.append(Paragraph("CIO RECOMMENDATION", t_subhdr))
+    rec_color = colors.HexColor('#1b5e20') if cio_recommendation == "BUY" else \
+                colors.HexColor('#006064') if cio_recommendation == "HOLD" else \
+                colors.HexColor('#e65100') if cio_recommendation == "WATCH" else colors.HexColor('#b71c1c')
+    story.append(Paragraph(f"<font color='#{'1b5e20' if cio_recommendation == 'BUY' else '006064' if cio_recommendation == 'HOLD' else 'e65100' if cio_recommendation == 'WATCH' else 'b71c1c'}'><b>{cio_recommendation}</b></font>",
+                           t_normal))
+    story.append(Spacer(1, 0.08*inch))
+    
+    # 8. Capital Allocation
+    story.append(Paragraph("PORTFOLIO ALLOCATION", t_subhdr))
+    story.append(Paragraph("[To be determined by CIO based on position sizing framework]", t_small))
+    story.append(Spacer(1, 0.15*inch))
+    
+    # Footer
+    story.append(Paragraph(f"MCIS Company Dossier | Generated {datetime.now().strftime('%B %d, %Y')} | "
+                           "Blueprint v1.1 | Not investment advice",
+                           ParagraphStyle('Footer', parent=styles['Normal'], fontSize=7,
+                                         textColor=colors.HexColor('#999999'), alignment=TA_CENTER)))
+    
+    doc.build(story)
+    return output_path
+
+# ─────────────────────────────────────────────
+# PAGE: COMPANY DOSSIER
+# ─────────────────────────────────────────────
+
+if page == "📄 Company Dossier":
+    st.markdown("""
+    <div class="mcis-header">
+        <p class="mcis-title">📄 Company Dossier</p>
+        <p class="mcis-subtitle">Professional 2-page institutional investment thesis — for Investment Committee review</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Load company data
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        dos_ticker = st.text_input("Enter ticker", placeholder="e.g. NVDA", key="dos_ticker").upper().strip()
+    with c2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load_dos = st.button("📥 Load")
+
+    if load_dos and dos_ticker:
+        with st.spinner(f"Fetching data for {dos_ticker}..."):
+            vd = fetch_valuation_data(dos_ticker)
+        if not vd.get("ok"):
+            st.error(f"Could not fetch data for {dos_ticker}.")
+        else:
+            st.session_state["dossier_data"] = vd
+
+    vd = st.session_state.get("dossier_data")
+    if vd and vd.get("ok"):
+        v = _val_inputs(vd)
+        result = run_filters(vd)
+        m = result.get("metrics", {})
+        pe = m.get("pe")
+
+        st.subheader(f"{vd['ticker']} — {vd.get('name','')}")
+        
+        # Valuation + quality outputs
+        checks, buff_score, mx = buffett_test(vd, v)
+        cat, note, peg, peg_v, g_pct = lynch_classify(vd, v, pe)
+        moat_rat, moat_sc, moat_ev = moat_assessment(vd, v)
+
+        # ── Form inputs for CIO section ──
+        st.markdown('<div class="section-header">⚙️ Complete the investment thesis</div>', unsafe_allow_html=True)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            cio_rec = st.radio("CIO Recommendation", ["BUY", "HOLD", "WATCH", "AVOID"], horizontal=True, key="cio_rec")
+        with c2:
+            port_weight = st.number_input("Suggested portfolio weight (%)", min_value=0.0, max_value=100.0, step=0.5, key="port_w")
+
+        st.markdown('<div class="section-header">Investment Edge (one paragraph)</div>', unsafe_allow_html=True)
+        inv_edge = st.text_area("Why is this company better than the other finalists? What's the competitive advantage or catalytic insight?",
+                                placeholder="e.g. 'NVDA's dominant position in AI inference semiconductors is protected by network effects in software ecosystems...'",
+                                height=80, key="inv_edge")
+
+        st.markdown('<div class="section-header">Material Risks (maximum 5, one per line)</div>', unsafe_allow_html=True)
+        risks = st.text_area("What could change our investment decision? List the 5 biggest risks.",
+                             placeholder="1. AI demand slowdown\n2. Competitive threat from AMD\n3. Geopolitical export restrictions\n4. Valuation compression\n5. Supply chain disruption",
+                             height=100, key="risks")
+
+        # Generate dossier
+        if st.button("📄 Generate Dossier PDF", key="gen_dos"):
+            with st.spinner("Generating professional dossier..."):
+                pdf_path = generate_dossier_pdf(dos_ticker, vd, v, result, checks, buff_score,
+                                               cat, note, peg, moat_rat, moat_sc,
+                                               cio_rec, inv_edge, risks)
+            
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    label="📥 Download Dossier PDF",
+                    data=f.read(),
+                    file_name=f"{dos_ticker}_MCIS_Dossier_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf",
+                    key="download_dos"
+                )
+            st.success(f"✅ Dossier generated — {dos_ticker}_MCIS_Dossier.pdf")
+            st.info("📋 This 2-page dossier is ready for Investment Committee presentation. "
+                   "Page 1 shows financials & ratios. Page 2 shows valuation & competitive analysis with your CIO thesis.")
+
+    else:
+        st.markdown('<div class="info-box">Enter a ticker and click <b>Load</b> to start building a professional investment dossier.</div>',
+                    unsafe_allow_html=True)
+
 
 # ═════════════════════════════════════════════
 # QUALITATIVE ALERT SYSTEM — engine
