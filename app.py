@@ -1148,6 +1148,39 @@ elif page == "🔍 Scanner":
                     errors += 1
                     continue
                 result = run_filters(data)
+                
+                # Enrich result with FCF/shares/net_debt for Target Entry calculation
+                if not result.get("fcf"):
+                    try:
+                        cf = data.get("cashflow", [])
+                        if cf and isinstance(cf, list) and len(cf) > 0 and isinstance(cf[0], dict):
+                            ocf = cf[0].get("operatingCashFlow")
+                            capex = cf[0].get("capitalExpenditure")
+                            if ocf is not None and capex is not None:
+                                result["fcf"] = float(ocf) - abs(float(capex))
+                    except:
+                        pass
+                
+                if not result.get("shares"):
+                    try:
+                        ttm_data = data.get("ttm", {})
+                        if isinstance(ttm_data, dict):
+                            shares = ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
+                            if shares:
+                                result["shares"] = float(shares)
+                    except:
+                        pass
+                
+                if not result.get("net_debt"):
+                    try:
+                        ttm = data.get("ttm", {})
+                        if isinstance(ttm, dict):
+                            total_debt = ttm.get("totalDebt") or ttm.get("totalLiabilities")
+                            cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash")
+                            if total_debt is not None and cash is not None:
+                                result["net_debt"] = float(total_debt or 0) - float(cash or 0)
+                    except:
+                        pass
 
                 if   result["layer"]=="LONG_TERM": t1.append(result)
                 elif result["layer"]=="MID_TERM":  t2.append(result)
