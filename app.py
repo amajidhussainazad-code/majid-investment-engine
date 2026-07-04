@@ -986,6 +986,46 @@ if page == "🏠 Dashboard":
         }
         st.dataframe(pd.DataFrame(alloc_data), use_container_width=True, hide_index=True)
 
+        # Fair Value Opportunities Snapshot
+        st.markdown('<div class="section-header">💎 Fair Value Opportunities — Quick Glance</div>', unsafe_allow_html=True)
+        
+        fv_opps = []
+        for r in sorted(t1 + t2, key=lambda x: x["score"], reverse=True)[:15]:  # Top 15 by score
+            try:
+                price = float(r.get("price", 0) or 0)
+                fcf = float(r.get("fcf", 0) or 0)
+                shares = float(r.get("shares", 0) or 0)
+                net_debt = float(r.get("net_debt", 0) or 0)
+                m = r.get("metrics", {})
+                rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
+                
+                if price > 0 and fcf > 100000 and shares > 0 and rev_cagr > 0:
+                    wacc, tg = 0.08, 0.025
+                    g1 = min(max(rev_cagr, 0.04), 0.25)
+                    pv_s1 = sum([fcf * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                    fcf_yr5 = fcf * ((1 + g1) ** 5)
+                    tv = (fcf_yr5 * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                    fv_ps = ((pv_s1 + tv) - net_debt) / shares
+                    
+                    if fv_ps > 1:
+                        discount = ((fv_ps - price) / price) * 100
+                        fv_opps.append({
+                            "Ticker": r["ticker"],
+                            "Current Price": f"${price:,.2f}",
+                            "Fair Value": f"${fv_ps:,.2f}",
+                            "Discount": f"{discount:+.0f}%",
+                            "Tier": r.get("verdict", ""),
+                        })
+            except:
+                pass
+        
+        if fv_opps:
+            fv_df = pd.DataFrame(fv_opps).sort_values("Discount", ascending=False)
+            st.dataframe(fv_df, use_container_width=True, hide_index=True)
+            st.caption("💡 Positive discount = undervalued (buy). Negative = overvalued (avoid)")
+        else:
+            st.info("Fair Value data will appear here after full company analysis. Go to 📄 Company Dossier for detailed calculations.")
+
 # ─────────────────────────────────────────────
 # PAGE: SCANNER
 # ─────────────────────────────────────────────
