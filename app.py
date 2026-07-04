@@ -494,13 +494,26 @@ def results_to_df(results):
 def fetch_historical_prices(ticker, days=1825):
     """Fetch 5 years of historical daily close prices from FMP."""
     try:
+        # Try main endpoint first
         raw = fmp_get("historical-price-full", {"symbol": ticker, "timeseries": days})
         if isinstance(raw, dict) and "historical" in raw:
             prices = raw["historical"]
-            if prices:
+            if prices and len(prices) > 0:
                 return sorted(prices, key=lambda x: x["date"])
+        
+        # Fallback: try without timeseries param
+        raw2 = fmp_get("historical-price-full", {"symbol": ticker})
+        if isinstance(raw2, dict) and "historical" in raw2:
+            prices = raw2["historical"]
+            if prices and len(prices) > 0:
+                # Filter to last ~5 years
+                cutoff = (datetime.now() - pd.Timedelta(days=1825)).strftime("%Y-%m-%d")
+                filtered = [p for p in prices if p.get("date", "") >= cutoff]
+                return sorted(filtered, key=lambda x: x["date"]) if filtered else sorted(prices, key=lambda x: x["date"])[:1825]
+        
         return []
-    except:
+    except Exception as e:
+        st.warning(f"Price fetch error: {str(e)[:50]}")
         return []
 
 def plot_5year_price_chart(prices, ticker, current_price=None):
@@ -1112,12 +1125,16 @@ elif page == "🔎 Company Lookup":
             st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
             with st.spinner(f"Fetching 5-year price data for {ticker_input}..."):
                 prices = fetch_historical_prices(ticker_input)
-            if prices:
+            if prices and len(prices) > 10:
                 fig = plot_5year_price_chart(prices, ticker_input, data.get("price"))
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Chart unavailable")
             else:
-                st.info("Historical price data not available")
+                st.info(f"⚠️ Historical price data not available for {ticker_input}. "
+                        f"This is a FMP API limitation for some tickers. "
+                        f"Current price from FMP: ${data.get('price', 'N/A')}")
 
             # Data Validation
             st.markdown('<div class="section-header">🔍 Data Quality Check</div>', unsafe_allow_html=True)
@@ -2220,12 +2237,16 @@ if page == "🏛 Valuation Engine":
             # 5-Year Price Chart
             st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
             prices = fetch_historical_prices(val_ticker)
-            if prices:
+            if prices and len(prices) > 10:
                 fig_price = plot_5year_price_chart(prices, val_ticker, v["price"])
                 if fig_price:
                     st.plotly_chart(fig_price, use_container_width=True)
+                else:
+                    st.info("Chart unavailable")
             else:
-                st.info("Historical price data not available")
+                st.info(f"⚠️ Historical price data not available for {val_ticker}. "
+                        f"This is a FMP API limitation for some tickers. "
+                        f"Current price: ${v['price']:,.2f}")
 
             base_ps = per_share["⚖️ Base"]
             base_mos = (1 - v["price"] / base_ps) * 100 if base_ps > 0 else -999
