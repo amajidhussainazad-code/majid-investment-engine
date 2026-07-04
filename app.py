@@ -528,38 +528,6 @@ def results_to_df(results):
     for r in results:
         m = r.get("metrics",{})
         
-        # Calculate Fair Value (DCF base case) - simple version for rankings
-        fv = "N/A"
-        discount = "N/A"
-        try:
-            # Get available data with explicit type conversion
-            price = float(r.get("price") or 0)
-            fcf = float(r.get("fcf") or 0)
-            shares = float(r.get("shares") or 0)
-            net_debt = float(r.get("net_debt") or 0)
-            rev_cagr = float(m.get("rev_cagr") or 0) / 100
-            
-            # Only calculate if we have MINIMUM viable data
-            if price > 0 and fcf > 100000 and shares > 0 and rev_cagr > 0:  # FCF in $
-                wacc = 0.08
-                tg = 0.025
-                g1 = min(max(rev_cagr, 0.04), 0.25)  # Growth rate 4-25%
-                
-                # 2-stage DCF
-                pv_s1 = sum([fcf * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                fcf_yr5 = fcf * ((1 + g1) ** 5)
-                fcf_yr6 = fcf_yr5 * (1 + tg)
-                tv = (fcf_yr6 / (wacc - tg)) / ((1 + wacc) ** 5)
-                eq_val = (pv_s1 + tv) - net_debt
-                fv_ps = eq_val / shares
-                
-                if fv_ps > 1:  # Only show if reasonable
-                    fv = f"${fv_ps:,.0f}"
-                    disc = ((fv_ps - price) / price) * 100
-                    discount = f"{disc:+.0f}%"
-        except Exception as e:
-            pass
-        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -572,8 +540,6 @@ def results_to_df(results):
             "Debt/EB":   m.get("debt_ebitda","N/A"),
             "P/E":       m.get("pe","N/A"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
-            "Fair Value": fv,
-            "Discount":  discount,
             "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
             "Halal":     r.get("halal","?"),
         })
