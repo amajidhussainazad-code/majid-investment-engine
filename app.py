@@ -395,7 +395,7 @@ with st.sidebar:
         "Navigate",
         ["🏠 Dashboard", "🔍 Scanner", "📊 Rankings", "🔎 Company Lookup",
          "🏛 Valuation Engine", "🚨 Qualitative Alerts", "📄 Company Dossier",
-         "📋 Watchlist", "⚡ Swing Trades", "📅 Quarterly Review"],
+         "📋 Watchlist", "⚡ Swing Trades", "📅 Quarterly Review", "🔬 Data Audit"],
         label_visibility="collapsed"
     )
 
@@ -485,6 +485,155 @@ def results_to_df(results):
             "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
         })
     return pd.DataFrame(rows)
+
+# ═════════════════════════════════════════════
+# PRICE CHART & DATA VALIDATION FUNCTIONS
+# ═════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def fetch_historical_prices(ticker, days=1825):
+    """Fetch 5 years of historical daily close prices from FMP."""
+    try:
+        raw = fmp_get("historical-price-full", {"symbol": ticker, "timeseries": days})
+        if isinstance(raw, dict) and "historical" in raw:
+            prices = raw["historical"]
+            if prices:
+                return sorted(prices, key=lambda x: x["date"])
+        return []
+    except:
+        return []
+
+def plot_5year_price_chart(prices, ticker, current_price=None):
+    """Create interactive 5-year price chart with Plotly."""
+    import plotly.graph_objects as go
+    
+    if not prices or len(prices) < 2:
+        return None
+    
+    dates = [p["date"] for p in prices]
+    closes = [float(p["close"]) for p in prices]
+    
+    closes_52w = closes[-252:] if len(closes) > 252 else closes
+    high_52w = max(closes_52w)
+    low_52w = min(closes_52w)
+    high_5y = max(closes)
+    low_5y = min(closes)
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates, y=closes, mode="lines", 
+                            name="Price", line=dict(color="#1a3c5e", width=2),
+                            hovertemplate="<b>%{x}</b><br>Close: $%{y:,.2f}<extra></extra>"))
+    
+    fig.add_hline(y=high_52w, line_dash="dash", line_color="#e65100", line_width=1,
+                 annotation_text=f"52W High: ${high_52w:,.0f}", annotation_position="right")
+    fig.add_hline(y=low_52w, line_dash="dash", line_color="#e65100", line_width=1,
+                 annotation_text=f"52W Low: ${low_52w:,.0f}", annotation_position="right")
+    
+    if current_price:
+        fig.add_hline(y=current_price, line_dash="solid", line_color="#1b5e20", line_width=3,
+                     annotation_text=f"Current: ${current_price:,.2f}", annotation_position="right")
+    
+    fig.update_layout(
+        title=f"{ticker} — 5-Year Price History | 5Y High: ${high_5y:,.0f} | 5Y Low: ${low_5y:,.0f}",
+        xaxis_title="Date", yaxis_title="Close Price ($)",
+        hovermode="x unified", height=380, template="plotly_white",
+        margin=dict(l=50, r=120, t=60, b=50))
+    return fig
+
+def validate_financial_data(d, result):
+    """Check for suspicious or impossible financial metrics."""
+    m = result.get("metrics", {})
+    flags = []
+    quality = "🟢 VALIDATED"
+    
+    gm = m.get("gm")
+    if gm is not None:
+        if gm > 90:
+            flags.append(f"⚠️ Gross margin {gm}% is unusually high — verify vs SEC filing")
+            quality = "🟡 CAUTION"
+        elif gm < 0:
+            flags.append(f"🔴 Gross margin {gm}% is negative — data error or distressed")
+            quality = "🔴 REQUIRES REVIEW"
+    
+    inc = d.get("income", []) or []
+    if inc and inc[0].get("revenue"):
+        nm = (float(inc[0].get("netIncome") or 0) / float(inc[0]["revenue"])) * 100
+        if nm > 50:
+            flags.append(f"⚠️ Net margin {nm:.1f}% is very high — verify vs competitors")
+            quality = "🟡 CAUTION"
+        elif nm < -50:
+            flags.append(f"🔴 Net margin {nm:.1f}% — deeply unprofitable")
+            quality = "🔴 REQUIRES REVIEW"
+    
+    revs = [float(yr.get("revenue") or 0) for yr in inc[:4] if yr.get("revenue")]
+    if len(revs) >= 2:
+        yoy_growth = ((revs[0] / revs[-1]) - 1) * 100
+        if yoy_growth > 200:
+            flags.append(f"⚠️ YoY revenue growth {yoy_growth:.0f}% — verify vs press release")
+            quality = "🟡 CAUTION"
+        elif yoy_growth < -50:
+            flags.append(f"🔴 Revenue down {yoy_growth:.0f}% YoY — significant contraction")
+            quality = "🔴 REQUIRES REVIEW"
+    
+    de = m.get("debt_ebitda")
+    if de is not None:
+        if de > 8:
+            flags.append(f"🔴 Debt/EBITDA {de:.1f}x is dangerously high")
+            quality = "🔴 REQUIRES REVIEW"
+        elif de > 5:
+            flags.append(f"⚠️ Debt/EBITDA {de:.1f}x — elevated leverage")
+            quality = "🟡 CAUTION"
+    
+    return {"quality_badge": quality, "flags": flags}
+
+@st.cache_data(ttl=86400)
+def audit_fmp_vs_yahoo(ticker):
+    """Compare FMP data against Yahoo Finance for validation."""
+    audit = {"ticker": ticker, "matches": {}, "discrepancies": []}
+    try:
+        import requests
+        # FMP data
+        fmp_data = fetch_company(ticker)
+        if not fmp_data.get("ok"):
+            return audit
+        
+        # Yahoo Finance data
+        yf_url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,incomeStatementHistory"
+        yf_resp = requests.get(yf_url, timeout=15)
+        yf_data = yf_resp.json()
+        
+        if "quoteSummary" not in yf_data or not yf_data["quoteSummary"].get("result"):
+            return audit
+        
+        yf = yf_data["quoteSummary"]["result"][0]
+        
+        # Compare revenue (most recent year)
+        fmp_rev = fmp_data.get("income", [])
+        yf_rev = yf.get("incomeStatementHistory", {}).get("incomeStatementHistory", [])
+        
+        if fmp_rev and yf_rev:
+            fmp_val = float(fmp_rev[0].get("revenue") or 0)
+            yf_val = float(yf_rev[0].get("totalRevenue", {}).get("raw") or 0)
+            if fmp_val and yf_val:
+                pct_diff = abs((fmp_val - yf_val) / yf_val) * 100
+                audit["matches"]["revenue"] = f"FMP ${fmp_val/1e9:.1f}B vs Yahoo ${yf_val/1e9:.1f}B (diff: {pct_diff:.1f}%)"
+                if pct_diff > 5:
+                    audit["discrepancies"].append(f"Revenue mismatch {pct_diff:.1f}%")
+        
+        # Compare price
+        fmp_price = fmp_data.get("price", 0)
+        yf_price = yf.get("financialData", {}).get("currentPrice", {}).get("raw", 0)
+        if fmp_price and yf_price:
+            pct_diff = abs((fmp_price - yf_price) / yf_price) * 100
+            audit["matches"]["price"] = f"FMP ${fmp_price:,.2f} vs Yahoo ${yf_price:,.2f} (diff: {pct_diff:.1f}%)"
+            if pct_diff > 2:
+                audit["discrepancies"].append(f"Price mismatch {pct_diff:.1f}%")
+        
+        audit["status"] = "✅ MATCH" if not audit["discrepancies"] else "⚠️ REVIEW"
+    except Exception as e:
+        audit["error"] = str(e)
+    
+    return audit
 
 # ═════════════════════════════════════════════
 # VALUATION ENGINE FUNCTIONS (global scope)
@@ -958,6 +1107,27 @@ elif page == "🔎 Company Lookup":
             if   h=="PASS":        st.success(f"✅ HALAL PASS — {result['halal_reason']}")
             elif h=="CONDITIONAL": st.warning(f"⚠️ CONDITIONAL — {result['halal_reason']} — Verify on Zoya (zoya.finance)")
             else:                  st.error(f"❌ HALAL FAIL — {result['halal_reason']}")
+
+            # 5-Year Price Chart
+            st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
+            with st.spinner(f"Fetching 5-year price data for {ticker_input}..."):
+                prices = fetch_historical_prices(ticker_input)
+            if prices:
+                fig = plot_5year_price_chart(prices, ticker_input, data.get("price"))
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Historical price data not available")
+
+            # Data Validation
+            st.markdown('<div class="section-header">🔍 Data Quality Check</div>', unsafe_allow_html=True)
+            validation = validate_financial_data(data, result)
+            st.caption(f"FMP Data Quality: {validation['quality_badge']}")
+            if validation['flags']:
+                for flag in validation['flags']:
+                    st.warning(flag)
+            else:
+                st.success("✓ No data quality issues detected")
 
             # Filter results
             col1, col2 = st.columns(2)
@@ -2047,6 +2217,16 @@ if page == "🏛 Valuation Engine":
                               xaxis_title="Value per share ($)", plot_bgcolor="white")
             st.plotly_chart(fig, use_container_width=True)
 
+            # 5-Year Price Chart
+            st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
+            prices = fetch_historical_prices(val_ticker)
+            if prices:
+                fig_price = plot_5year_price_chart(prices, val_ticker, v["price"])
+                if fig_price:
+                    st.plotly_chart(fig_price, use_container_width=True)
+            else:
+                st.info("Historical price data not available")
+
             base_ps = per_share["⚖️ Base"]
             base_mos = (1 - v["price"] / base_ps) * 100 if base_ps > 0 else -999
             if base_mos >= mos_req:
@@ -2228,3 +2408,122 @@ if page == "🚨 Qualitative Alerts":
         st.markdown('<div class="info-box">No Tier 1 or watchlist companies found yet — run the Scanner first, '
                     'or add tickers manually above.</div>', unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────
+# PAGE: DATA AUDIT
+# ─────────────────────────────────────────────
+
+if page == "🔬 Data Audit":
+    st.markdown("""
+    <div class="mcis-header">
+        <p class="mcis-title">🔬 Data Audit</p>
+        <p class="mcis-subtitle">Spot-check FMP data against Yahoo Finance & SEC filings — ensure data quality</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="info-box">
+    <b>Why data audit matters:</b> FMP is fast and convenient, but occasionally returns stale or incorrect data.
+    This page compares FMP against Yahoo Finance (daily) and SEC filings (official source) for a sample of companies.
+    Any major discrepancy (<5% variance flags caution, >10% requires review).
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">🔍 Sample Companies to Validate</div>', unsafe_allow_html=True)
+    st.caption("These 5 companies represent different sectors and market caps. A clean audit on these suggests data quality is solid.")
+
+    sample_tickers = ["NVDA", "MSFT", "ASML", "SNOW", "AMD"]
+    audit_results = {}
+
+    if st.button("🚀 Run Data Audit on Sample"):
+        prog = st.progress(0, text="Starting audit...")
+        for i, ticker in enumerate(sample_tickers):
+            prog.progress((i + 1) / len(sample_tickers), text=f"Auditing {ticker}...")
+            audit_results[ticker] = audit_fmp_vs_yahoo(ticker)
+        prog.empty()
+        st.session_state["audit_results"] = audit_results
+        st.session_state["audit_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    results = st.session_state.get("audit_results", {})
+    if results:
+        st.caption(f"Last audit: {st.session_state.get('audit_time','')}")
+
+        # Summary cards
+        passed = sum(1 for r in results.values() if r.get("status") == "✅ MATCH")
+        flagged = sum(1 for r in results.values() if r.get("status") == "⚠️ REVIEW")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f'<div class="metric-card tier1-card"><div class="metric-value" style="color:#1b5e20">{passed}</div><div class="metric-label">✅ Data Matches Yahoo</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown(f'<div class="metric-card tier3-card"><div class="metric-value" style="color:#e65100">{flagged}</div><div class="metric-label">⚠️ Minor Discrepancies</div></div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="section-header">📋 Detailed Audit Results</div>', unsafe_allow_html=True)
+        
+        for ticker in sample_tickers:
+            audit = results.get(ticker, {})
+            status = audit.get("status", "⚠️ REVIEW")
+            
+            with st.expander(f"{status} — {ticker}"):
+                if "error" in audit:
+                    st.error(f"Error: {audit['error']}")
+                else:
+                    # Matches
+                    if audit.get("matches"):
+                        st.success("✓ Data Matches:")
+                        for metric, comparison in audit["matches"].items():
+                            st.write(f"  • {metric.upper()}: {comparison}")
+                    
+                    # Discrepancies
+                    if audit.get("discrepancies"):
+                        st.warning("⚠️ Discrepancies Found:")
+                        for disc in audit["discrepancies"]:
+                            st.write(f"  • {disc}")
+                        st.caption("**Action:** Verify the higher variance in SEC filings or contact FMP support")
+                    else:
+                        st.success("No material discrepancies detected")
+
+        st.markdown("""
+        <div class="warning-box">
+        <b>Data Quality Guidelines:</b>
+        🟢 <5% variance = Confidence in FMP data
+        🟡 5-10% variance = Note the variance, use with caution
+        🔴 >10% variance = Verify against SEC filings before using in analysis
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Export audit results
+        audit_df_rows = []
+        for ticker in sample_tickers:
+            audit = results.get(ticker, {})
+            audit_df_rows.append({
+                "Ticker": ticker,
+                "Status": audit.get("status", "N/A"),
+                "Matches": len(audit.get("matches", {})),
+                "Discrepancies": len(audit.get("discrepancies", [])),
+            })
+        audit_df = pd.DataFrame(audit_df_rows)
+        st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-header">📊 Add Custom Ticker to Audit</div>', unsafe_allow_html=True)
+        custom_ticker = st.text_input("Enter ticker to audit", placeholder="e.g. AAPL").upper().strip()
+        if st.button("🔍 Audit Ticker") and custom_ticker:
+            with st.spinner(f"Auditing {custom_ticker}..."):
+                custom_audit = audit_fmp_vs_yahoo(custom_ticker)
+            status = custom_audit.get("status", "⚠️ REVIEW")
+            st.subheader(f"{status} — {custom_ticker}")
+            if "error" in custom_audit:
+                st.error(f"Error: {custom_audit['error']}")
+            else:
+                if custom_audit.get("matches"):
+                    st.success("✓ Data Matches:")
+                    for metric, comparison in custom_audit["matches"].items():
+                        st.write(f"  • {metric.upper()}: {comparison}")
+                if custom_audit.get("discrepancies"):
+                    st.warning("⚠️ Discrepancies Found:")
+                    for disc in custom_audit["discrepancies"]:
+                        st.write(f"  • {disc}")
+                else:
+                    st.success("No material discrepancies detected")
+
+    else:
+        st.markdown('<div class="info-box">Click <b>Run Data Audit</b> to validate FMP data against Yahoo Finance for a sample of companies.</div>', unsafe_allow_html=True)
