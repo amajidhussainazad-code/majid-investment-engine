@@ -967,8 +967,20 @@ if page == "🏠 Dashboard":
         </div>
         """, unsafe_allow_html=True)
     else:
+        # ⚠️ CLARIFICATION NOTE
+        st.markdown("""
+        <div style="background-color: #E3F2FD; border-left: 4px solid #1976D2; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+        <b>📌 Important Distinction:</b><br>
+        <b>Tier 1 = QUALITY COMPANIES</b> (excellent fundamentals)<br>
+        <b>BUT NOT NECESSARILY BUY PRICES</b> (may be overvalued)<br><br>
+        ✅ Use this list to find <b>wonderful companies</b><br>
+        💰 Use <b>Valuation Engine</b> to find <b>good entry prices</b><br><br>
+        Example: MSFT is Tier 1 (quality) but 🔴 AVOID at $390 (overpriced). Target entry: $147
+        </div>
+        """, unsafe_allow_html=True)
+        
         # Top Tier 1 table
-        st.markdown('<div class="section-header">🏆 Top Tier 1 Companies — Buy Candidates</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">🏆 Top Tier 1 Companies — Quality Universe</div>', unsafe_allow_html=True)
         if t1:
             df = results_to_df(sorted(t1, key=lambda x: x["score"], reverse=True)[:10])
             st.dataframe(df[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Halal","Price","Mkt Cap"]],
@@ -1111,6 +1123,8 @@ elif page == "🔍 Scanner":
 
             except Exception as e:
                 errors += 1
+                if i < 3:  # Show first few errors
+                    status_text.text(f"⚠️ Error fetching {ticker}: {str(e)[:50]}")
 
         # Sort by score
         t1.sort(key=lambda x:x["score"],reverse=True)
@@ -1947,7 +1961,80 @@ if page == "📄 Company Dossier":
 
         st.subheader(f"{vd['ticker']} — {vd.get('name','')}")
         
-        # Valuation + quality outputs
+        # ═══════════════════════════════════════════
+        # AUTOMATIC BUY/HOLD/AVOID SIGNAL
+        # ═══════════════════════════════════════════
+        
+        # Calculate base case fair value
+        fcf0 = v.get("fcf0", 0)
+        shares = v.get("shares", 0)
+        net_debt = v.get("net_debt", 0)
+        price = v.get("price", 0)
+        wacc = 0.08
+        tg = 0.025
+        g1_base = min(max(v.get("rev_cagr", 0.10), 0.04), 0.25)
+        mos_req = 50  # Default 50% margin of safety requirement
+        
+        auto_signal = "⚠️ ANALYZE"
+        signal_color = "#FFA500"  # Orange
+        signal_detail = "Insufficient data for automatic signal"
+        
+        if fcf0 > 0 and shares > 0 and price > 0:
+            try:
+                # DCF calculation
+                pv_s1 = sum([fcf0 * ((1 + g1_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                fcf_yr5 = fcf0 * ((1 + g1_base) ** 5)
+                tv = (fcf_yr5 * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                fv_ps = ((pv_s1 + tv) - net_debt) / shares if shares > 0 else 0
+                discount = ((fv_ps - price) / price) * 100 if price > 0 else 0
+                
+                if fv_ps > 0:
+                    if discount >= mos_req:
+                        auto_signal = "🟢 BUY"
+                        signal_color = "#1b5e20"
+                        signal_detail = f"Undervalued by {discount:.0f}% (FV: ${fv_ps:,.0f} vs Price: ${price:,.2f})"
+                    elif discount >= 0:
+                        auto_signal = "🟡 HOLD"
+                        signal_color = "#F59E0B"
+                        signal_detail = f"Fairly valued with {discount:.0f}% upside (FV: ${fv_ps:,.0f})"
+                    else:
+                        auto_signal = "🔴 AVOID"
+                        signal_color = "#DC2626"
+                        signal_detail = f"Overvalued by {abs(discount):.0f}% (FV: ${fv_ps:,.0f} vs Price: ${price:,.2f})"
+            except:
+                pass
+        
+        # Display signal prominently - SIMPLE VERSION
+        col1, col2, col3 = st.columns([2, 2, 2])
+        
+        with col1:
+            if auto_signal == "🔴 AVOID":
+                st.error(f"**{auto_signal}**\n{signal_detail}")
+            elif auto_signal == "🟢 BUY":
+                st.success(f"**{auto_signal}**\n{signal_detail}")
+            elif auto_signal == "🟡 HOLD":
+                st.warning(f"**{auto_signal}**\n{signal_detail}")
+            else:
+                st.info(f"**{auto_signal}**\n{signal_detail}")
+        
+        with col2:
+            st.metric("Current Price", f"${price:,.2f}")
+        
+        with col3:
+            if fcf0 > 0 and shares > 0 and price > 0:
+                try:
+                    pv_s1 = sum([fcf0 * ((1 + g1_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                    fcf_yr5 = fcf0 * ((1 + g1_base) ** 5)
+                    tv = (fcf_yr5 * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                    fv_ps = ((pv_s1 + tv) - net_debt) / shares if shares > 0 else 0
+                    st.metric("Fair Value", f"${fv_ps:,.0f}")
+                except:
+                    st.metric("Fair Value", "N/A")
+            else:
+                st.metric("Fair Value", "N/A")
+        
+        st.markdown("---")
+        # Valuation + quality outputs (for later use in form)
         checks, buff_score, mx = buffett_test(vd, v)
         cat, note, peg, peg_v, g_pct = lynch_classify(vd, v, pe)
         moat_rat, moat_sc, moat_ev = moat_assessment(vd, v)
