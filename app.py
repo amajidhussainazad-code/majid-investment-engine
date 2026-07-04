@@ -535,37 +535,60 @@ def results_to_df(results):
     for r in results:
         m = r.get("metrics",{})
         
-        # Calculate Target Entry Range (Bear to Base with 50% MOS)
+        # Calculate Target Entry Range (multiple approaches)
         target_entry = "N/A"
         try:
             price = float(r.get("price", 0) or 0)
-            fcf = float(r.get("fcf", 0) or 0)
-            shares = float(r.get("shares", 0) or 0)
-            net_debt = float(r.get("net_debt", 0) or 0)
-            rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
             
-            if fcf > 100000 and shares > 0 and price > 0 and rev_cagr > 0:
-                wacc = 0.08
-                tg = 0.025
+            if price > 0:
+                # METHOD 1: DCF-based (if FCF/shares available)
+                fcf = float(r.get("fcf", 0) or 0)
+                shares = float(r.get("shares", 0) or 0)
+                net_debt = float(r.get("net_debt", 0) or 0)
+                rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
                 
-                # BEAR case (conservative 6% growth)
-                g_bear = 0.06
-                pv_s1_bear = sum([fcf * ((1 + g_bear) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                fcf_yr5_bear = fcf * ((1 + g_bear) ** 5)
-                tv_bear = (fcf_yr5_bear * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
-                fv_bear = ((pv_s1_bear + tv_bear) - net_debt) / shares if shares > 0 else 0
+                if fcf > 0 and shares > 0 and rev_cagr > 0:
+                    wacc = 0.08
+                    tg = 0.025
+                    
+                    # BEAR case (conservative 6% growth)
+                    g_bear = 0.06
+                    pv_s1_bear = sum([fcf * ((1 + g_bear) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                    fcf_yr5_bear = fcf * ((1 + g_bear) ** 5)
+                    tv_bear = (fcf_yr5_bear * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                    fv_bear = ((pv_s1_bear + tv_bear) - net_debt) / shares if shares > 0 else 0
+                    
+                    # BASE case (realistic growth based on CAGR)
+                    g_base = min(max(rev_cagr, 0.04), 0.25)
+                    pv_s1_base = sum([fcf * ((1 + g_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                    fcf_yr5_base = fcf * ((1 + g_base) ** 5)
+                    tv_base = (fcf_yr5_base * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                    fv_base = ((pv_s1_base + tv_base) - net_debt) / shares if shares > 0 else 0
+                    
+                    if fv_bear > 1 and fv_base > 1:
+                        target_bear = fv_bear * (1 - 0.50)
+                        target_base = fv_base * (1 - 0.50)
+                        target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
                 
-                # BASE case (realistic growth based on CAGR)
-                g_base = min(max(rev_cagr, 0.04), 0.25)
-                pv_s1_base = sum([fcf * ((1 + g_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                fcf_yr5_base = fcf * ((1 + g_base) ** 5)
-                tv_base = (fcf_yr5_base * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
-                fv_base = ((pv_s1_base + tv_base) - net_debt) / shares if shares > 0 else 0
+                # METHOD 2: Fallback using P/E and growth (if DCF not available)
+                if target_entry == "N/A":
+                    pe = float(m.get("pe", 0) or 0)
+                    rev_cagr = float(m.get("rev_cagr", 0) or 0)
+                    
+                    if pe > 0 and rev_cagr > 0:
+                        # Fair value estimate: P/E * (1 + growth%) * quality factor
+                        # Conservative estimate: discount 40-60%
+                        fair_value_est = price / (pe / (rev_cagr / 100))
+                        
+                        if fair_value_est > 0:
+                            target_bear = fair_value_est * (1 - 0.60)  # 60% discount
+                            target_base = fair_value_est * (1 - 0.40)  # 40% discount
+                            target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
                 
-                if fv_bear > 1 and fv_base > 1:
-                    # Target Entry Range = 50% MOS on both scenarios
-                    target_bear = fv_bear * (1 - 0.50)
-                    target_base = fv_base * (1 - 0.50)
+                # METHOD 3: Simple heuristic (buy at 30-50% discount)
+                if target_entry == "N/A":
+                    target_bear = price * 0.50  # 50% discount
+                    target_base = price * 0.70  # 30% discount
                     target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
         except:
             pass
