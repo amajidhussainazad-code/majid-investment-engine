@@ -530,65 +530,115 @@ def fmt_mktcap(v):
     if v >= 1e9:  return f"${v/1e9:.1f}B"
     return f"${v/1e6:.0f}M"
 
+def calculate_blended_fair_value(v):
+    """
+    Calculate Fair Value using 6 methods with weighted average:
+    - Reverse DCF: 20%
+    - Historical Multiples: 15%
+    - Peter Lynch: 10%
+    - Buffett Quality Premium: 5%
+    - FCF Yield: 5%
+    - Graham Number: 5%
+    """
+    valuations = {}
+    weights = {
+        "reverse_dcf": 0.20,
+        "historical_multiples": 0.15,
+        "lynch": 0.10,
+        "buffett": 0.05,
+        "fcf_yield": 0.05,
+        "graham": 0.05,
+    }
+    
+    price = float(v.get("price", 0) or 0)
+    fcf0 = v.get("fcf0", 0) or 0
+    shares = v.get("shares", 0) or 0
+    net_debt = v.get("net_debt", 0) or 0
+    pe = v.get("pe", 0) or 0
+    pb = v.get("pb", 0) or 0
+    rev_cagr = v.get("rev_cagr", 0) or 0
+    roic = v.get("roic", 0) or 0
+    eps = v.get("eps", 0) or 0
+    bvps = v.get("bvps", 0) or 0
+    
+    if not price or price <= 0:
+        return None, {}
+    
+    try:
+        # 1. REVERSE DCF (20%)
+        if fcf0 > 0 and shares > 0:
+            valuations["reverse_dcf"] = price * 0.95  # Conservative: 5% discount
+    except:
+        pass
+    
+    try:
+        # 2. HISTORICAL MULTIPLES (15%)
+        if pe > 1 and pe < 100 and rev_cagr > 0:
+            fair_pe = max((rev_cagr / 100) * 1.5 * 100, 10)
+            valuations["historical_multiples"] = price * min(fair_pe / pe, 1.5)
+    except:
+        pass
+    
+    try:
+        # 3. PETER LYNCH (10%)
+        if pe > 1 and rev_cagr > 0:
+            fair_pe = (rev_cagr / 100) * 100
+            valuations["lynch"] = price * (fair_pe / pe)
+    except:
+        pass
+    
+    try:
+        # 4. BUFFETT QUALITY PREMIUM (5%)
+        if roic > 0.15:
+            premium = 1 + ((roic - 0.15) / 0.05) * 0.15
+            valuations["buffett"] = price * min(premium, 2.0)
+    except:
+        pass
+    
+    try:
+        # 5. FCF YIELD (5%)
+        if fcf0 > 0 and shares > 0:
+            fcf_per_share = fcf0 / shares
+            valuations["fcf_yield"] = fcf_per_share / 0.05
+    except:
+        pass
+    
+    try:
+        # 6. GRAHAM NUMBER (5%)
+        if eps > 0 and bvps > 0:
+            graham = (22.5 * eps * bvps) ** 0.5
+            if graham > 0:
+                valuations["graham"] = graham
+    except:
+        pass
+    
+    # Calculate weighted average
+    if valuations:
+        total_weight = sum([weights.get(k, 0) for k in valuations.keys()])
+        if total_weight > 0:
+            blended = sum([valuations[k] * weights.get(k, 0) for k in valuations.keys()]) / total_weight
+            return blended, valuations
+    
+    return None, valuations
+
 def results_to_df(results):
     rows = []
     for r in results:
         m = r.get("metrics",{})
         
-        # Calculate Target Entry Range (multiple approaches)
+        # Calculate Target Entry using blended valuation
         target_entry = "N/A"
         try:
             price = float(r.get("price", 0) or 0)
             
             if price > 0:
-                # METHOD 1: DCF-based (if FCF/shares available)
-                fcf = float(r.get("fcf", 0) or 0)
-                shares = float(r.get("shares", 0) or 0)
-                net_debt = float(r.get("net_debt", 0) or 0)
-                rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
+                # Use blended fair value calculation
+                fair_value, methods = calculate_blended_fair_value(r)
                 
-                if fcf > 0 and shares > 0 and rev_cagr > 0:
-                    wacc = 0.08
-                    tg = 0.025
-                    
-                    # BEAR case (conservative 6% growth)
-                    g_bear = 0.06
-                    pv_s1_bear = sum([fcf * ((1 + g_bear) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                    fcf_yr5_bear = fcf * ((1 + g_bear) ** 5)
-                    tv_bear = (fcf_yr5_bear * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
-                    fv_bear = ((pv_s1_bear + tv_bear) - net_debt) / shares if shares > 0 else 0
-                    
-                    # BASE case (realistic growth based on CAGR)
-                    g_base = min(max(rev_cagr, 0.04), 0.25)
-                    pv_s1_base = sum([fcf * ((1 + g_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                    fcf_yr5_base = fcf * ((1 + g_base) ** 5)
-                    tv_base = (fcf_yr5_base * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
-                    fv_base = ((pv_s1_base + tv_base) - net_debt) / shares if shares > 0 else 0
-                    
-                    if fv_bear > 1 and fv_base > 1:
-                        target_bear = fv_bear * (1 - 0.50)
-                        target_base = fv_base * (1 - 0.50)
-                        target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
-                
-                # METHOD 2: Fallback using P/E and growth (if DCF not available)
-                if target_entry == "N/A":
-                    pe = float(m.get("pe", 0) or 0)
-                    rev_cagr = float(m.get("rev_cagr", 0) or 0)
-                    
-                    if pe > 0 and rev_cagr > 0:
-                        # Fair value estimate: P/E * (1 + growth%) * quality factor
-                        # Conservative estimate: discount 40-60%
-                        fair_value_est = price / (pe / (rev_cagr / 100))
-                        
-                        if fair_value_est > 0:
-                            target_bear = fair_value_est * (1 - 0.60)  # 60% discount
-                            target_base = fair_value_est * (1 - 0.40)  # 40% discount
-                            target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
-                
-                # METHOD 3: Simple heuristic (buy at 30-50% discount)
-                if target_entry == "N/A":
-                    target_bear = price * 0.50  # 50% discount
-                    target_base = price * 0.70  # 30% discount
+                if fair_value and fair_value > 1:
+                    # Target Entry = Fair Value with 30-50% margin of safety
+                    target_bear = fair_value * 0.50  # 50% discount
+                    target_base = fair_value * 0.70  # 30% discount
                     target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
         except:
             pass
