@@ -469,44 +469,6 @@ def results_to_df(results):
     for r in results:
         m = r.get("metrics",{})
         
-        # Calculate Fair Value (DCF base case)
-        fv = "N/A"
-        discount = "N/A"
-        try:
-            fcf0 = r.get("fcf", 0)
-            shares = r.get("shares", 0)
-            price = r.get("price", 0)
-            rev_cagr = m.get("rev_cagr", 0) / 100 if m.get("rev_cagr") else 0.10
-            
-            if fcf0 > 0 and shares > 0 and price > 0:
-                # Simple DCF: 2-stage model
-                wacc = 0.08
-                tg = 0.025
-                g1 = min(max(rev_cagr, 0.04), 0.25)  # Clamp between 4-25%
-                
-                # Stage 1: 5 years of growth
-                pv_stage1 = 0
-                for yr in range(1, 6):
-                    cf = fcf0 * ((1 + g1) ** yr)
-                    pv_stage1 += cf / ((1 + wacc) ** yr)
-                
-                # Stage 2: Terminal value (fade growth to terminal)
-                fcf_year5 = fcf0 * ((1 + g1) ** 5)
-                fcf_year6 = fcf_year5 * (1 + tg)
-                tv = (fcf_year6 / (wacc - tg)) / ((1 + wacc) ** 5)
-                
-                total_pv = pv_stage1 + tv
-                net_debt = r.get("net_debt", 0)
-                equity_value = total_pv - net_debt
-                fv_per_share = equity_value / shares if shares > 0 else 0
-                
-                if fv_per_share > 0:
-                    fv = f"${fv_per_share:,.0f}"
-                    discount_pct = ((fv_per_share - price) / price) * 100
-                    discount = f"{discount_pct:+.0f}%"
-        except:
-            pass
-        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -520,8 +482,6 @@ def results_to_df(results):
             "P/E":       m.get("pe","N/A"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
             "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
-            "Fair Value": fv,
-            "Discount":  discount,
             "Halal":     r.get("halal","?"),
         })
     return pd.DataFrame(rows)
