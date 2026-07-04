@@ -387,16 +387,45 @@ with st.sidebar:
                 unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# SESSION STATE
+# PERSISTENT STORAGE
 # ─────────────────────────────────────────────
+SAVE_FILE = "mcis_data.json"
+
+def save_to_disk():
+    try:
+        data = {
+            "scan_results": st.session_state.get("scan_results", []),
+            "watchlist":    st.session_state.get("watchlist", []),
+            "swing_trades": st.session_state.get("swing_trades", []),
+            "last_scan":    st.session_state.get("last_scan", None),
+        }
+        with open(SAVE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        pass
+
+def load_from_disk():
+    try:
+        if os.path.exists(SAVE_FILE):
+            with open(SAVE_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return None
+
+# ─────────────────────────────────────────────
+# SESSION STATE — load from disk on startup
+# ─────────────────────────────────────────────
+_saved = load_from_disk()
+
 if "scan_results" not in st.session_state:
-    st.session_state.scan_results = []
+    st.session_state.scan_results = _saved["scan_results"] if _saved and "scan_results" in _saved else []
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = []
+    st.session_state.watchlist = _saved["watchlist"] if _saved and "watchlist" in _saved else []
 if "swing_trades" not in st.session_state:
-    st.session_state.swing_trades = []
+    st.session_state.swing_trades = _saved["swing_trades"] if _saved and "swing_trades" in _saved else []
 if "last_scan" not in st.session_state:
-    st.session_state.last_scan = None
+    st.session_state.last_scan = _saved["last_scan"] if _saved and "last_scan" in _saved else None
 
 # ─────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -594,6 +623,7 @@ elif page == "🔍 Scanner":
         all_results = t1+t2+t3
         st.session_state.scan_results = all_results
         st.session_state.last_scan = datetime.now().strftime("%B %d, %Y at %H:%M")
+        save_to_disk()
 
         status_text.text("✅ Scan complete!")
         progress_bar.progress(1.0)
@@ -932,3 +962,5 @@ elif page == "📅 Quarterly Review":
             st.balloons()
         else:
             st.warning("Some checklist items are incomplete. Review them before finalising.")
+
+# This line intentionally left blank
