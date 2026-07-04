@@ -90,13 +90,32 @@ st.markdown("""
     }
     .stButton>button:hover { opacity: 0.9; }
 
-    div[data-testid="stSidebarContent"] {
-        background: #1a3c5e;
+    /* Sidebar background and all text */
+    [data-testid="stSidebar"] {
+        background-color: #1a3c5e !important;
     }
-    .css-1d391kg { background: #1a3c5e; }
+    [data-testid="stSidebar"] * {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] .stRadio label {
+        color: white !important;
+        font-size: 0.95em !important;
+    }
+    [data-testid="stSidebar"] .stRadio div {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] p {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] span {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: #c9a84c !important;
+    }
 
     .sidebar-title { color: #c9a84c; font-size: 1.3em; font-weight: 700; }
-    .sidebar-text  { color: white; font-size: 0.9em; }
+    .sidebar-text  { color: white !important; font-size: 0.9em; }
 
     .info-box {
         background: #e3f2fd;
