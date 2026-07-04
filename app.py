@@ -2227,3 +2227,4 @@ if page == "🚨 Qualitative Alerts":
     elif not universe:
         st.markdown('<div class="info-box">No Tier 1 or watchlist companies found yet — run the Scanner first, '
                     'or add tickers manually above.</div>', unsafe_allow_html=True)
+reportlab>=3.6.0
