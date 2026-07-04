@@ -145,7 +145,7 @@ st.markdown("""
 try:
     API_KEY = st.secrets["FMP_API_KEY"]
 except Exception:
-    API_KEY = "EBgvBcpXZ972yqnngUEMujYeBuk2cPZy"
+    API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n"  # ← NEW UPGRADED KEY
 BASE    = "https://financialmodelingprep.com/stable"
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
@@ -468,6 +468,45 @@ def results_to_df(results):
     rows = []
     for r in results:
         m = r.get("metrics",{})
+        
+        # Calculate Fair Value (DCF base case)
+        fv = "N/A"
+        discount = "N/A"
+        try:
+            fcf0 = r.get("fcf", 0)
+            shares = r.get("shares", 0)
+            price = r.get("price", 0)
+            rev_cagr = m.get("rev_cagr", 0) / 100 if m.get("rev_cagr") else 0.10
+            
+            if fcf0 > 0 and shares > 0 and price > 0:
+                # Simple DCF: 2-stage model
+                wacc = 0.08
+                tg = 0.025
+                g1 = min(max(rev_cagr, 0.04), 0.25)  # Clamp between 4-25%
+                
+                # Stage 1: 5 years of growth
+                pv_stage1 = 0
+                for yr in range(1, 6):
+                    cf = fcf0 * ((1 + g1) ** yr)
+                    pv_stage1 += cf / ((1 + wacc) ** yr)
+                
+                # Stage 2: Terminal value (fade growth to terminal)
+                fcf_year5 = fcf0 * ((1 + g1) ** 5)
+                fcf_year6 = fcf_year5 * (1 + tg)
+                tv = (fcf_year6 / (wacc - tg)) / ((1 + wacc) ** 5)
+                
+                total_pv = pv_stage1 + tv
+                net_debt = r.get("net_debt", 0)
+                equity_value = total_pv - net_debt
+                fv_per_share = equity_value / shares if shares > 0 else 0
+                
+                if fv_per_share > 0:
+                    fv = f"${fv_per_share:,.0f}"
+                    discount_pct = ((fv_per_share - price) / price) * 100
+                    discount = f"{discount_pct:+.0f}%"
+        except:
+            pass
+        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -479,10 +518,10 @@ def results_to_df(results):
             "RevCAGR%":  m.get("rev_cagr","N/A"),
             "Debt/EB":   m.get("debt_ebitda","N/A"),
             "P/E":       m.get("pe","N/A"),
-            "EV/EBITDA": m.get("ev_ebitda","N/A"),
-            "Halal":     r.get("halal","?"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
-            "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
+            "Fair Value": fv,
+            "Discount":  discount,
+            "Halal":     r.get("halal","?"),
         })
     return pd.DataFrame(rows)
 
@@ -491,66 +530,93 @@ def results_to_df(results):
 # ═════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def fetch_historical_prices(ticker, days=1825):
-    """Fetch 5 years of historical daily close prices from FMP."""
+def fetch_historical_prices_yahoo(ticker, days=1825):
+    """Fetch 5 years of historical daily close prices from FMP (now unlocked with premium)."""
     try:
-        # Try main endpoint first
         raw = fmp_get("historical-price-full", {"symbol": ticker, "timeseries": days})
-        if isinstance(raw, dict) and "historical" in raw:
-            prices = raw["historical"]
-            if prices and len(prices) > 0:
-                return sorted(prices, key=lambda x: x["date"])
         
-        # Fallback: try without timeseries param
-        raw2 = fmp_get("historical-price-full", {"symbol": ticker})
-        if isinstance(raw2, dict) and "historical" in raw2:
-            prices = raw2["historical"]
-            if prices and len(prices) > 0:
-                # Filter to last ~5 years
-                cutoff = (datetime.now() - pd.Timedelta(days=1825)).strftime("%Y-%m-%d")
-                filtered = [p for p in prices if p.get("date", "") >= cutoff]
-                return sorted(filtered, key=lambda x: x["date"]) if filtered else sorted(prices, key=lambda x: x["date"])[:1825]
+        # Debug: check what we got back
+        if isinstance(raw, dict):
+            if "historical" in raw:
+                prices = raw["historical"]
+                if prices and len(prices) > 0:
+                    return sorted(prices, key=lambda x: x["date"])
+            elif "error" in raw:
+                return None  # Silent fail, will show message to user
+            else:
+                # Got dict but no historical or error key
+                return None
+        
+        if isinstance(raw, list) and len(raw) > 0:
+            return raw
         
         return []
     except Exception as e:
-        st.warning(f"Price fetch error: {str(e)[:50]}")
         return []
 
-def plot_5year_price_chart(prices, ticker, current_price=None):
-    """Create interactive 5-year price chart with Plotly."""
+def plot_5year_price_chart_yahoo(prices, ticker, current_price=None):
+    """Create interactive 5-year price chart from Yahoo Finance data using Plotly."""
     import plotly.graph_objects as go
     
     if not prices or len(prices) < 2:
         return None
     
+    # Handle both list of dicts and dict with summary stats
+    if isinstance(prices, dict):
+        # Summary stats only, no daily data
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"<b>{ticker} Price Summary</b><br>" +
+                 f"Current: ${prices.get('current_price', 0):,.2f}<br>" +
+                 f"52W High: ${prices.get('52w_high', 0):,.2f}<br>" +
+                 f"52W Low: ${prices.get('52w_low', 0):,.2f}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14),
+            align="center"
+        )
+        fig.update_layout(height=300, template="plotly_white", margin=dict(l=50, r=50, t=50, b=50))
+        return fig
+    
+    # Has daily data
     dates = [p["date"] for p in prices]
     closes = [float(p["close"]) for p in prices]
+    highs = [float(p.get("high", p["close"])) for p in prices]
+    lows = [float(p.get("low", p["close"])) for p in prices]
     
     closes_52w = closes[-252:] if len(closes) > 252 else closes
-    high_52w = max(closes_52w)
-    low_52w = min(closes_52w)
+    high_52w = max(closes_52w) if closes_52w else max(closes)
+    low_52w = min(closes_52w) if closes_52w else min(closes)
     high_5y = max(closes)
     low_5y = min(closes)
     
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates, y=closes, mode="lines", 
-                            name="Price", line=dict(color="#1a3c5e", width=2),
-                            hovertemplate="<b>%{x}</b><br>Close: $%{y:,.2f}<extra></extra>"))
     
+    # Price line
+    fig.add_trace(go.Scatter(
+        x=dates, y=closes, mode="lines", 
+        name="Close Price",
+        line=dict(color="#1a3c5e", width=2),
+        hovertemplate="<b>%{x}</b><br>Close: $%{y:,.2f}<extra></extra>"
+    ))
+    
+    # 52-week range
     fig.add_hline(y=high_52w, line_dash="dash", line_color="#e65100", line_width=1,
                  annotation_text=f"52W High: ${high_52w:,.0f}", annotation_position="right")
     fig.add_hline(y=low_52w, line_dash="dash", line_color="#e65100", line_width=1,
                  annotation_text=f"52W Low: ${low_52w:,.0f}", annotation_position="right")
     
+    # Current price
     if current_price:
         fig.add_hline(y=current_price, line_dash="solid", line_color="#1b5e20", line_width=3,
                      annotation_text=f"Current: ${current_price:,.2f}", annotation_position="right")
     
     fig.update_layout(
-        title=f"{ticker} — 5-Year Price History | 5Y High: ${high_5y:,.0f} | 5Y Low: ${low_5y:,.0f}",
+        title=f"{ticker} — 5-Year Price History | High: ${high_5y:,.0f} | Low: ${low_5y:,.0f}",
         xaxis_title="Date", yaxis_title="Close Price ($)",
         hovermode="x unified", height=380, template="plotly_white",
         margin=dict(l=50, r=120, t=60, b=50))
+    
     return fig
 
 def validate_financial_data(d, result):
@@ -1075,7 +1141,26 @@ elif page == "🔎 Company Lookup":
     </div>
     """, unsafe_allow_html=True)
 
-    ticker_input = st.text_input("Enter ticker symbol", placeholder="e.g. NVDA").upper().strip()
+    # Get available tickers from scan results
+    available_tickers = sorted(set([r["ticker"] for r in st.session_state.scan_results]))
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        if available_tickers:
+            ticker_input = st.selectbox(
+                "Select company or type ticker",
+                [""] + available_tickers,
+                index=0,
+                key="lookup_ticker_select"
+            )
+            if not ticker_input:
+                ticker_input = st.text_input("Or enter ticker manually", placeholder="e.g. NVDA").upper().strip()
+        else:
+            ticker_input = st.text_input("Enter ticker symbol", placeholder="e.g. NVDA").upper().strip()
+            st.caption("💡 Run the Scanner first to populate the dropdown")
+    
+    with col2:
+        st.empty()  # Spacer
 
     if st.button("🔍 Analyse Company") and ticker_input:
         with st.spinner(f"Fetching live data for {ticker_input}..."):
@@ -1123,18 +1208,29 @@ elif page == "🔎 Company Lookup":
 
             # 5-Year Price Chart
             st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
-            with st.spinner(f"Fetching 5-year price data for {ticker_input}..."):
-                prices = fetch_historical_prices(ticker_input)
+            with st.spinner(f"Fetching price data for {ticker_input}..."):
+                prices = fetch_historical_prices_yahoo(ticker_input)
+            
             if prices and len(prices) > 10:
-                fig = plot_5year_price_chart(prices, ticker_input, data.get("price"))
+                fig = plot_5year_price_chart_yahoo(prices, ticker_input, data.get("price"))
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Chart unavailable")
             else:
-                st.info(f"⚠️ Historical price data not available for {ticker_input}. "
-                        f"This is a FMP API limitation for some tickers. "
-                        f"Current price from FMP: ${data.get('price', 'N/A')}")
+                with st.expander("🔧 Troubleshooting: Why no price history?"):
+                    st.warning(f"⚠️ FMP historical-price-full endpoint not returning data for {ticker_input}")
+                    st.caption("""
+                    **Possible reasons:**
+                    - Endpoint not available on your current FMP plan (verify in FMP dashboard)
+                    - API key needs to fully activate (wait 15 minutes)
+                    - Ticker symbol issue (verify ticker exists)
+                    
+                    **Current price from FMP:** $""" + str(data.get('price', 'N/A')) + """
+                    
+                    Check: Go to FMP dashboard → test historical-price-full endpoint manually
+                    """)
+                st.info(f"Current price from FMP: ${data.get('price', 'N/A')}")
 
             # Data Validation
             st.markdown('<div class="section-header">🔍 Data Quality Check</div>', unsafe_allow_html=True)
@@ -1427,27 +1523,60 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
                            t_small))
     story.append(Spacer(1, 0.15*inch))
     
-    # 1. Income Statement (5 years)
+    # 1. Income Statement (5 years) — CURRENT YEAR AND 4 PRIOR YEARS
+    from datetime import datetime
+    current_year = datetime.now().year
+    years_header = [str(current_year - 4 + i) for i in range(5)]  # e.g., 2022, 2023, 2024, 2025, 2026
+    
     story.append(Paragraph("INCOME STATEMENT (5 YEARS)", t_subhdr))
     inc = _tbl_rows(d, ['income6', 'income'], years=5)
-    inc_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    inc_rows = [["Metric"] + years_header]
+    
     for label, key, fmt_fn in [
         ("Revenue", "revenue", lambda x: _format_number(x)),
         ("Revenue Growth %", "__rev_cagr__", lambda x: "—"),
         ("Gross Profit", "grossProfit", lambda x: _format_number(x)),
-        ("Gross Margin %", "grossProfitMargin", lambda x: _pct(x)),
+        ("Gross Margin %", "__gm_pct__", lambda x: _pct(x)),
         ("Operating Income", "operatingIncome", lambda x: _format_number(x)),
-        ("Operating Margin %", "__op_margin__", lambda x: "—"),
+        ("Operating Margin %", "__op_margin_pct__", lambda x: _pct(x)),
         ("Net Income", "netIncome", lambda x: _format_number(x)),
-        ("Net Margin %", "__net_margin__", lambda x: "—"),
+        ("Net Margin %", "__nm_pct__", lambda x: _pct(x)),
         ("EPS", "eps", lambda x: f"${float(x):.2f}" if x else "—"),
     ]:
         row = [label]
         for i, yr in enumerate(inc):
-            if key.startswith("__"):
-                if key == "__rev_cagr__" and i == 4 and v.get("rev_cagr"):
+            if key == "__rev_cagr__":
+                if i == 4 and v.get("rev_cagr"):
                     row.append(f"{v['rev_cagr']*100:.1f}%")
-                else: row.append("—")
+                else:
+                    row.append("—")
+            elif key == "__gm_pct__":
+                # Calculate Gross Margin % = Gross Profit / Revenue
+                rev = yr.get("revenue")
+                gp = yr.get("grossProfit")
+                if rev and gp and rev > 0:
+                    gm_pct = (float(gp) / float(rev)) * 100
+                    row.append(f"{gm_pct:.1f}%")
+                else:
+                    row.append("—")
+            elif key == "__op_margin_pct__":
+                # Calculate Operating Margin % = Operating Income / Revenue
+                rev = yr.get("revenue")
+                oi = yr.get("operatingIncome")
+                if rev and oi and rev > 0:
+                    om_pct = (float(oi) / float(rev)) * 100
+                    row.append(f"{om_pct:.1f}%")
+                else:
+                    row.append("—")
+            elif key == "__nm_pct__":
+                # Calculate Net Margin % = Net Income / Revenue
+                rev = yr.get("revenue")
+                ni = yr.get("netIncome")
+                if rev and ni and rev > 0:
+                    nm_pct = (float(ni) / float(rev)) * 100
+                    row.append(f"{nm_pct:.1f}%")
+                else:
+                    row.append("—")
             else:
                 val = yr.get(key)
                 row.append(fmt_fn(val) if val else "—")
@@ -1473,7 +1602,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     # 2. Cash Flow Statement (5 years)
     story.append(Paragraph("CASH FLOW STATEMENT (5 YEARS)", t_subhdr))
     cf = _tbl_rows(d, ['cashflow6', 'cashflow'], years=5)
-    cf_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    cf_rows = [["Metric"] + years_header]
     for label, key in [
         ("Operating Cash Flow", "operatingCashFlow"),
         ("Capital Expenditure", "capitalExpenditure"),
@@ -1511,7 +1640,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     # 3. Balance Sheet (5 years)
     story.append(Paragraph("BALANCE SHEET & CAPITAL STRUCTURE (5 YEARS)", t_subhdr))
     bal = _tbl_rows(d, ['balance'], years=5)
-    bal_rows = [["Metric", "2019", "2020", "2021", "2022", "2023"]]
+    bal_rows = [["Metric"] + years_header]
     for label, key in [
         ("Cash & Equivalents", "cashAndShortTermInvestments"),
         ("Total Debt", "totalDebt"),
@@ -1574,8 +1703,39 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     
     # 5. Price Section
     story.append(Paragraph("PRICE & VALUATION METRICS", t_subhdr))
+    
+    # Calculate Fair Value (DCF base case)
+    fv_per_share = "N/A"
+    margin_of_safety = "N/A"
+    try:
+        if v.get("fcf0", 0) > 0 and v.get("shares", 0) > 0:
+            fcf0 = v["fcf0"]
+            shares = v["shares"]
+            price = v["price"]
+            wacc = 0.08
+            tg = 0.025
+            g1 = min(max(v.get("rev_cagr", 0.10), 0.04), 0.25)
+            
+            # 2-stage DCF
+            pv_stage1 = sum([fcf0 * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+            fcf_year5 = fcf0 * ((1 + g1) ** 5)
+            fcf_year6 = fcf_year5 * (1 + tg)
+            tv = (fcf_year6 / (wacc - tg)) / ((1 + wacc) ** 5)
+            total_pv = pv_stage1 + tv
+            equity_value = total_pv - v.get("net_debt", 0)
+            fv_ps = equity_value / shares if shares > 0 else 0
+            
+            if fv_ps > 0:
+                fv_per_share = f"${fv_ps:,.2f}"
+                mos = ((fv_ps - price) / price) * 100 if price > 0 else 0
+                margin_of_safety = f"{mos:+.1f}%"
+    except:
+        pass
+    
     price_info = [
         ["Current Price", f"${v['price']:,.2f}"],
+        ["Fair Value (DCF)", fv_per_share],
+        ["Margin of Safety", margin_of_safety],
         ["Market Cap", fmt_mktcap(v['mktcap'])],
         ["MCIS Score", f"{result['score']}/100"],
         ["MCIS Verdict", result['verdict']],
@@ -2158,7 +2318,22 @@ if page == "🏛 Valuation Engine":
 
     c1, c2 = st.columns([3, 1])
     with c1:
-        val_ticker = st.text_input("Ticker symbol", placeholder="e.g. NVDA", key="val_ticker_in").upper().strip()
+        # Get available tickers from scan results
+        available_tickers = sorted(set([r["ticker"] for r in st.session_state.scan_results]))
+        
+        if available_tickers:
+            val_ticker = st.selectbox(
+                "Select company or type ticker",
+                [""] + available_tickers,
+                index=0,
+                key="val_ticker_select"
+            )
+            if not val_ticker:
+                val_ticker = st.text_input("Or enter ticker manually", placeholder="e.g. NVDA", key="val_ticker_in").upper().strip()
+        else:
+            val_ticker = st.text_input("Ticker symbol", placeholder="e.g. NVDA", key="val_ticker_in").upper().strip()
+            st.caption("💡 Run the Scanner first to populate the dropdown")
+    
     with c2:
         st.markdown("<br>", unsafe_allow_html=True)
         load = st.button("📥 Load Company")
@@ -2236,17 +2411,15 @@ if page == "🏛 Valuation Engine":
 
             # 5-Year Price Chart
             st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
-            prices = fetch_historical_prices(val_ticker)
+            prices = fetch_historical_prices_yahoo(val_ticker)
             if prices and len(prices) > 10:
-                fig_price = plot_5year_price_chart(prices, val_ticker, v["price"])
+                fig_price = plot_5year_price_chart_yahoo(prices, val_ticker, v["price"])
                 if fig_price:
                     st.plotly_chart(fig_price, use_container_width=True)
                 else:
                     st.info("Chart unavailable")
             else:
-                st.info(f"⚠️ Historical price data not available for {val_ticker}. "
-                        f"This is a FMP API limitation for some tickers. "
-                        f"Current price: ${v['price']:,.2f}")
+                st.info(f"⚠️ Price history not available for {val_ticker}. Current price: ${v['price']:,.2f}")
 
             base_ps = per_share["⚖️ Base"]
             base_mos = (1 - v["price"] / base_ps) * 100 if base_ps > 0 else -999
