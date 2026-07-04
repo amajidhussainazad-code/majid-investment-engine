@@ -528,6 +528,41 @@ def results_to_df(results):
     for r in results:
         m = r.get("metrics",{})
         
+        # Calculate Target Entry Range (Bear to Base with 50% MOS)
+        target_entry = "N/A"
+        try:
+            price = float(r.get("price", 0) or 0)
+            fcf = float(r.get("fcf", 0) or 0)
+            shares = float(r.get("shares", 0) or 0)
+            net_debt = float(r.get("net_debt", 0) or 0)
+            rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
+            
+            if fcf > 100000 and shares > 0 and price > 0 and rev_cagr > 0:
+                wacc = 0.08
+                tg = 0.025
+                
+                # BEAR case (conservative 6% growth)
+                g_bear = 0.06
+                pv_s1_bear = sum([fcf * ((1 + g_bear) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                fcf_yr5_bear = fcf * ((1 + g_bear) ** 5)
+                tv_bear = (fcf_yr5_bear * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                fv_bear = ((pv_s1_bear + tv_bear) - net_debt) / shares if shares > 0 else 0
+                
+                # BASE case (realistic growth based on CAGR)
+                g_base = min(max(rev_cagr, 0.04), 0.25)
+                pv_s1_base = sum([fcf * ((1 + g_base) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                fcf_yr5_base = fcf * ((1 + g_base) ** 5)
+                tv_base = (fcf_yr5_base * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
+                fv_base = ((pv_s1_base + tv_base) - net_debt) / shares if shares > 0 else 0
+                
+                if fv_bear > 1 and fv_base > 1:
+                    # Target Entry Range = 50% MOS on both scenarios
+                    target_bear = fv_bear * (1 - 0.50)
+                    target_base = fv_base * (1 - 0.50)
+                    target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
+        except:
+            pass
+        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -540,6 +575,7 @@ def results_to_df(results):
             "Debt/EB":   m.get("debt_ebitda","N/A"),
             "P/E":       m.get("pe","N/A"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
+            "Target Entry": target_entry,
             "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
             "Halal":     r.get("halal","?"),
         })
@@ -983,7 +1019,7 @@ if page == "🏠 Dashboard":
         st.markdown('<div class="section-header">🏆 Top Tier 1 Companies — Quality Universe</div>', unsafe_allow_html=True)
         if t1:
             df = results_to_df(sorted(t1, key=lambda x: x["score"], reverse=True)[:10])
-            st.dataframe(df[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Halal","Price","Mkt Cap"]],
+            st.dataframe(df[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Halal"]],
                         use_container_width=True, hide_index=True)
         else:
             st.info("No Tier 1 results yet. Run the scanner first.")
