@@ -212,43 +212,50 @@ def fetch_company(ticker):
             # FCF = Operating CF - CapEx (most recent year)
             cf = d.get("cashflow", [])
             if cf and isinstance(cf, list) and len(cf) > 0 and isinstance(cf[0], dict):
-                ocf = cf[0].get("operatingCashFlow")
-                capex = cf[0].get("capitalExpenditure")
+                ocf = cf[0].get("operatingCashFlow") or cf[0].get("operatingCashflows")
+                capex = cf[0].get("capitalExpenditure") or cf[0].get("capitalExpenditures")
                 if ocf is not None and capex is not None:
-                    d["fcf"] = float(ocf) - abs(float(capex))
+                    fcf_val = float(ocf) - abs(float(capex))
+                    if fcf_val > 0:
+                        d["fcf"] = fcf_val
         except Exception as e:
             pass
         
         try:
-            # Shares Outstanding - try multiple field names
-            # Try from metrics first (TTM data is most reliable)
+            # Shares Outstanding - try multiple sources
+            shares = None
+            
+            # Try TTM first
             ttm_data = d.get("ttm", {})
             if isinstance(ttm_data, dict):
-                shares = ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
-                if shares:
-                    d["shares"] = float(shares)
+                shares = ttm_data.get("weightedAverageShsOut") or ttm_data.get("weightedAverageShsOutDil") or ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
             
-            # Fallback: try from metrics/ratios
-            if "shares" not in d:
+            # Try metrics
+            if not shares:
                 met = d.get("metrics", [])
                 if met and isinstance(met, list) and len(met) > 0 and isinstance(met[0], dict):
-                    shares = met[0].get("numberOfShares") or met[0].get("sharesOutstanding") or met[0].get("commonStockSharesIssued")
-                    if shares:
-                        d["shares"] = float(shares)
+                    shares = met[0].get("weightedAverageShsOut") or met[0].get("weightedAverageShsOutDil") or met[0].get("numberOfShares") or met[0].get("sharesOutstanding")
+            
+            # Try profile
+            if not shares and d.get("profile"):
+                shares = d["profile"].get("shFloat") or d["profile"].get("sharesOutstanding") or d["profile"].get("sharesFloat")
+            
+            if shares and shares > 0:
+                d["shares"] = float(shares)
         except Exception as e:
             pass
         
         try:
-            # Net Debt = Total Debt - Cash (use TTM for most recent)
+            # Net Debt = Total Debt - Cash
             ttm = d.get("ttm", {})
             if isinstance(ttm, dict):
-                total_debt = ttm.get("totalDebt") or ttm.get("totalLiabilities")
-                cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash")
+                total_debt = ttm.get("totalDebt") or ttm.get("longTermDebt") or ttm.get("totalLiabilities", 0)
+                cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash") or ttm.get("shortTermInvestments", 0)
                 
-                if total_debt is not None and cash is not None:
-                    d["net_debt"] = float(total_debt or 0) - float(cash or 0)
-                elif total_debt is not None:
-                    d["net_debt"] = float(total_debt or 0)
+                if total_debt and cash is not None:
+                    d["net_debt"] = float(total_debt) - float(cash)
+                elif total_debt:
+                    d["net_debt"] = float(total_debt)
         except Exception as e:
             pass
 
@@ -1149,38 +1156,13 @@ elif page == "🔍 Scanner":
                     continue
                 result = run_filters(data)
                 
-                # Enrich result with FCF/shares/net_debt for Target Entry calculation
-                if not result.get("fcf"):
-                    try:
-                        cf = data.get("cashflow", [])
-                        if cf and isinstance(cf, list) and len(cf) > 0 and isinstance(cf[0], dict):
-                            ocf = cf[0].get("operatingCashFlow")
-                            capex = cf[0].get("capitalExpenditure")
-                            if ocf is not None and capex is not None:
-                                result["fcf"] = float(ocf) - abs(float(capex))
-                    except:
-                        pass
-                
-                if not result.get("shares"):
-                    try:
-                        ttm_data = data.get("ttm", {})
-                        if isinstance(ttm_data, dict):
-                            shares = ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
-                            if shares:
-                                result["shares"] = float(shares)
-                    except:
-                        pass
-                
-                if not result.get("net_debt"):
-                    try:
-                        ttm = data.get("ttm", {})
-                        if isinstance(ttm, dict):
-                            total_debt = ttm.get("totalDebt") or ttm.get("totalLiabilities")
-                            cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash")
-                            if total_debt is not None and cash is not None:
-                                result["net_debt"] = float(total_debt or 0) - float(cash or 0)
-                    except:
-                        pass
+                # Pass through FCF/shares/net_debt from fetch_company to result
+                if data.get("fcf"):
+                    result["fcf"] = data["fcf"]
+                if data.get("shares"):
+                    result["shares"] = data["shares"]
+                if data.get("net_debt"):
+                    result["net_debt"] = data["net_debt"]
 
                 if   result["layer"]=="LONG_TERM": t1.append(result)
                 elif result["layer"]=="MID_TERM":  t2.append(result)
