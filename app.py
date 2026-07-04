@@ -530,6 +530,27 @@ def fmt_mktcap(v):
     if v >= 1e9:  return f"${v/1e9:.1f}B"
     return f"${v/1e6:.0f}M"
 
+def analyze_etf_prices(etf_ticker):
+    """Fetch and analyze 5-year ETF price history"""
+    try:
+        hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
+        if not isinstance(hist, dict) or "historical" not in hist:
+            return None
+        prices = hist.get("historical", [])
+        if not prices:
+            return None
+        current = float(prices[0].get("close", 0))
+        five_year = prices[:1250] if len(prices) > 1250 else prices
+        closes = [float(p.get("close", 0)) for p in five_year if p.get("close")]
+        if not closes:
+            return None
+        high_5y = max(closes)
+        low_5y = min(closes)
+        buy_target = low_5y * 0.95
+        return {"current": current, "high": high_5y, "low": low_5y, "target": buy_target}
+    except:
+        return None
+
 def calculate_blended_fair_value(r):
     """
     Calculate Fair Value using 6 weighted methods.
@@ -1089,7 +1110,7 @@ if page == "🏠 Dashboard":
         </div>
         """, unsafe_allow_html=True)
     else:
-        # ⚠️ CLARIFICATION NOTE
+        # Important Distinction note (moved up)
         st.markdown("""
         <div style="background-color: #E3F2FD; border-left: 4px solid #1976D2; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
         <b>📌 Important Distinction:</b><br>
@@ -1100,13 +1121,125 @@ if page == "🏠 Dashboard":
         Example: MSFT is Tier 1 (quality) but 🔴 AVOID at $390 (overpriced). Target entry: $147
         </div>
         """, unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════════════════════
+        # 🟢 READY TO BUY NOW — ACTION ITEMS
+        # ═══════════════════════════════════════════════════════════
+        st.markdown('<div class="section-header">🟢 READY TO BUY NOW — Action Items</div>', unsafe_allow_html=True)
         
-        # Top Tier 1 table
-        st.markdown('<div class="section-header">🏆 Top Tier 1 Companies — Quality Universe</div>', unsafe_allow_html=True)
-        if t1:
-            df = results_to_df(sorted(t1, key=lambda x: x["score"], reverse=True)[:10])
-            st.dataframe(df[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Halal"]],
+        buy_now = []
+        for r in t1:
+            try:
+                price = float(r.get("price", 0) or 0)
+                target_entry = r.get("target_entry", "N/A")
+                
+                if target_entry != "N/A" and "-" in target_entry:
+                    try:
+                        range_str = target_entry.replace("$", "").replace(",", "")
+                        low, high = [float(x.strip()) for x in range_str.split("-")]
+                        
+                        # If current price is at or below target entry = BUY NOW
+                        if price <= high:
+                            r["buy_signal"] = "🟢 BUY"
+                            buy_now.append(r)
+                    except:
+                        pass
+            except:
+                pass
+        
+        if buy_now:
+            st.markdown(f"**🎯 {len(buy_now)} companies ready to buy** — within Target Entry range, excellent opportunities!")
+            df_buy = results_to_df(sorted(buy_now, key=lambda x: x["score"], reverse=True))
+            st.dataframe(df_buy[["Ticker","Company","Score","ROIC%","GM%","Price","Target Entry","Halal"]],
                         use_container_width=True, hide_index=True)
+            st.caption("✅ These are your immediate buy candidates. Add to portfolio when capital available.")
+        else:
+            st.info("⏳ No Tier 1 companies at buy prices right now. Check back after market corrections!")
+        
+        st.markdown("---")
+
+        # Capital allocation
+        st.markdown('<div class="section-header">💰 Capital Allocation — $5,000 Starting Capital</div>', unsafe_allow_html=True)
+        alloc_data = {
+            "Layer": ["Halal ETF Core","Tier 1 Compounders","Tier 2 Growth","Swing/Tactical","Opportunity Cash"],
+            "Allocation": ["30%","25%","20%","5%","20%"],
+            "Amount": ["$1,500","$1,250","$1,000","$250","$1,000"],
+            "What to Buy": ["SPUS + SPTE + SPWO","Top 3-4 Tier 1 companies","Top 2-3 Tier 2 companies","Options/special situations","Money market — deploy on crash"],
+        }
+        st.dataframe(pd.DataFrame(alloc_data), use_container_width=True, hide_index=True)
+
+        # ETF ANALYSIS: 5-YEAR PRICE RANGES
+        st.markdown('<div class="section-header">💎 Halal ETF Core — 5-Year Price Analysis</div>', unsafe_allow_html=True)
+        
+        etf_list = ["SPUS", "SPTE", "SPWO"]
+        etf_data = []
+        
+        for ticker in etf_list:
+            etf_info = analyze_etf_prices(ticker)
+            if etf_info:
+                current = etf_info["current"]
+                high = etf_info["high"]
+                low = etf_info["low"]
+                target = etf_info["target"]
+                
+                if current <= target:
+                    signal = "🟢 BUY"
+                elif current <= (high + low) / 2:
+                    signal = "🟡 WAIT"
+                else:
+                    signal = "🔴 HOLD"
+                
+                etf_data.append({
+                    "ETF": ticker,
+                    "Current": f"${current:.2f}",
+                    "5Y High": f"${high:.2f}",
+                    "5Y Low": f"${low:.2f}",
+                    "Buy Target": f"${target:.2f}",
+                    "Signal": signal,
+                })
+        
+        if etf_data:
+            st.dataframe(pd.DataFrame(etf_data), use_container_width=True, hide_index=True)
+            st.caption("💡 Buy Target = 5-year low with 5% safety margin. Tier 1 core allocation.")
+        else:
+            st.info("📊 ETF price data loading... Please refresh in a moment.")
+        
+        st.markdown("---")
+
+        # 🏆 ALL TIER 1 COMPANIES WITH SIGNALS
+        st.markdown('<div class="section-header">🏆 All Tier 1 Companies — With Signals</div>', unsafe_allow_html=True)
+        
+        if t1:
+            # Add signal to each Tier 1 company
+            for r in t1:
+                try:
+                    price = float(r.get("price", 0) or 0)
+                    target_entry = r.get("target_entry", "N/A")
+                    
+                    if target_entry != "N/A" and "-" in target_entry:
+                        try:
+                            range_str = target_entry.replace("$", "").replace(",", "")
+                            low, high = [float(x.strip()) for x in range_str.split("-")]
+                            
+                            if price <= high:
+                                r["signal"] = "🟢 BUY"
+                            elif price <= high * 1.3:
+                                r["signal"] = "🟡 WAIT"
+                            else:
+                                r["signal"] = "🔴 AVOID"
+                        except:
+                            r["signal"] = "⚠️ ANALYZE"
+                    else:
+                        r["signal"] = "⚠️ ANALYZE"
+                except:
+                    r["signal"] = "⚠️ ANALYZE"
+            
+            df_t1 = results_to_df(sorted(t1, key=lambda x: x["score"], reverse=True)[:15])
+            df_t1["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in sorted(t1, key=lambda x: x["score"], reverse=True)[:15]]
+            
+            st.dataframe(df_t1[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
+                        use_container_width=True, hide_index=True)
+            st.caption("📊 Top 15 Tier 1 companies with investment signals. Load in Valuation Engine for detailed analysis.")
         else:
             st.info("No Tier 1 results yet. Run the scanner first.")
 
@@ -1119,6 +1252,46 @@ if page == "🏠 Dashboard":
             "What to Buy": ["SPUS + SPTE + SPWO","Top 3-4 Tier 1 companies","Top 2-3 Tier 2 companies","Options/special situations","Money market — deploy on crash"],
         }
         st.dataframe(pd.DataFrame(alloc_data), use_container_width=True, hide_index=True)
+
+        # ETF ANALYSIS: 5-YEAR PRICE RANGES
+        st.markdown('<div class="section-header">💎 Halal ETF Core — 5-Year Price Analysis</div>', unsafe_allow_html=True)
+        
+        etf_list = ["SPUS", "SPTE", "SPWO"]
+        etf_data = []
+        
+        for ticker in etf_list:
+            etf_info = analyze_etf_prices(ticker)
+            if etf_info:
+                current = etf_info["current"]
+                high = etf_info["high"]
+                low = etf_info["low"]
+                target = etf_info["target"]
+                
+                # Determine signal
+                if current <= target:
+                    signal = "🟢 BUY"
+                    signal_color = "green"
+                elif current <= (high + low) / 2:
+                    signal = "🟡 WAIT"
+                    signal_color = "orange"
+                else:
+                    signal = "🔴 HOLD"
+                    signal_color = "red"
+                
+                etf_data.append({
+                    "ETF": ticker,
+                    "Current": f"${current:.2f}",
+                    "5Y High": f"${high:.2f}",
+                    "5Y Low": f"${low:.2f}",
+                    "Buy Target": f"${target:.2f}",
+                    "Signal": signal,
+                })
+        
+        if etf_data:
+            st.dataframe(pd.DataFrame(etf_data), use_container_width=True, hide_index=True)
+            st.caption("💡 Buy Target = 5-year low with 5% safety margin. Tier 1 core allocation.")
+        else:
+            st.info("📊 ETF price data loading... Please refresh in a moment.")
 
         # Fair Value Opportunities Snapshot
         st.markdown('<div class="section-header">💎 Fair Value Opportunities — Quick Glance</div>', unsafe_allow_html=True)
@@ -1476,12 +1649,47 @@ elif page == "📋 Watchlist":
     st.markdown("""
     <div class="mcis-header">
         <p class="mcis-title">📋 MCIS Watchlist</p>
-        <p class="mcis-subtitle">Your saved companies across all tiers</p>
+        <p class="mcis-subtitle">Tier 1 companies at buy prices + manual adds</p>
     </div>
     """, unsafe_allow_html=True)
 
     watchlist = st.session_state.watchlist
 
+    # AUTO-WATCHLIST: Add Tier 1 companies within Target Entry range
+    auto_buy_candidates = []
+    try:
+        scan_results = st.session_state.get("scan_results", [])
+        for r in scan_results:
+            if r.get("verdict") == "TIER 1":
+                price = float(r.get("price", 0) or 0)
+                # Parse Target Entry range
+                target_entry = r.get("target_entry", "N/A")
+                if target_entry != "N/A" and "-" in target_entry:
+                    try:
+                        range_str = target_entry.replace("$", "").replace(",", "")
+                        low, high = [float(x.strip()) for x in range_str.split("-")]
+                        # If current price is within or below target entry range = BUY
+                        if price <= high:
+                            r["buy_signal"] = f"🟢 BUY at ${price:,.2f}"
+                            auto_buy_candidates.append(r)
+                    except:
+                        pass
+    except:
+        pass
+
+    if auto_buy_candidates:
+        st.markdown('<div class="section-header">🟢 Auto-Buy Candidates — Tier 1 at Target Entry</div>', unsafe_allow_html=True)
+        st.markdown(f"**{len(auto_buy_candidates)} companies ready to buy** (within Target Entry range)")
+        
+        df_auto = results_to_df(auto_buy_candidates)
+        st.dataframe(df_auto[["Ticker","Company","Score","Tier","ROIC%","GM%","Price","Target Entry","Halal"]],
+                    use_container_width=True, hide_index=True)
+        
+        st.caption("💡 These Tier 1 companies are at or below your Target Entry price. Perfect entry points.")
+
+    # MANUAL ADDITIONS
+    st.markdown('<div class="section-header">➕ Manual Watchlist</div>', unsafe_allow_html=True)
+    
     # Add manually
     col1,col2 = st.columns([3,1])
     with col1:
@@ -1497,11 +1705,11 @@ elif page == "📋 Watchlist":
                     st.success(f"{new_ticker} added")
 
     if not watchlist:
-        st.markdown('<div class="info-box">Your watchlist is empty. Add companies from the Scanner, Rankings or Company Lookup pages.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box">Your manual watchlist is empty. Add companies from Rankings or Company Lookup.</div>', unsafe_allow_html=True)
     else:
-        st.caption(f"{len(watchlist)} companies on watchlist")
+        st.caption(f"{len(watchlist)} companies on manual watchlist")
         df = results_to_df(watchlist)
-        st.dataframe(df[["Ticker","Company","Sector","Score","Tier","ROIC%","GM%","RevCAGR%","Halal","Price","Mkt Cap"]],
+        st.dataframe(df[["Ticker","Company","Sector","Score","Tier","ROIC%","GM%","RevCAGR%","Halal","Price","Target Entry"]],
                     use_container_width=True, hide_index=True,
                     column_config={"Score": st.column_config.ProgressColumn("Score",min_value=0,max_value=100)})
 
