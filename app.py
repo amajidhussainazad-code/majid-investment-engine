@@ -212,6 +212,18 @@ def fetch_company(ticker):
         d["err"] = str(e)
     return d
 
+def fetch_valuation_data(ticker):
+    """Fetch 6 years of financials for valuation and dossier."""
+    d = fetch_company(ticker)
+    if not d.get("ok"): return d
+    d["income6"]   = fmp_get("income-statement",     {"symbol": ticker, "period": "annual", "limit": 6})
+    d["cashflow6"] = fmp_get("cash-flow-statement",  {"symbol": ticker, "period": "annual", "limit": 6})
+    d["balance"]   = fmp_get("balance-sheet-statement", {"symbol": ticker, "period": "annual", "limit": 2})
+    q = fmp_get("quote", {"symbol": ticker})
+    d["quote"] = q[0] if isinstance(q, list) and q else {}
+    d["metrics6"]  = fmp_get("key-metrics", {"symbol": ticker, "period": "annual", "limit": 6})
+    return d
+
 # ─────────────────────────────────────────────
 # HALAL CHECK
 # ─────────────────────────────────────────────
@@ -474,9 +486,201 @@ def results_to_df(results):
         })
     return pd.DataFrame(rows)
 
+# ═════════════════════════════════════════════
+# VALUATION ENGINE FUNCTIONS (global scope)
+# ═════════════════════════════════════════════
+
+def _val_inputs(d):
+    """Extract the raw numbers the valuation engine needs."""
+    v = {}
+    q   = d.get("quote", {})
+    bal = d.get("balance", []) or []
+    cf  = d.get("cashflow6", []) or []
+    inc = d.get("income6", []) or []
+    v["price"]  = float(q.get("price") or d.get("price") or 0)
+    v["shares"] = float(q.get("sharesOutstanding") or 0)
+    if not v["shares"] and v["price"] and d.get("mktcap"):
+        v["shares"] = d["mktcap"] / v["price"]
+    v["mktcap"] = float(q.get("marketCap") or d.get("mktcap") or 0)
+    b0 = bal[0] if bal else {}
+    cash = float(b0.get("cashAndShortTermInvestments") or b0.get("cashAndCashEquivalents") or 0)
+    debt = float(b0.get("totalDebt") or 0)
+    v["net_debt"] = debt - cash
+    fcf_hist = [float(y["freeCashFlow"]) for y in reversed(cf) if y.get("freeCashFlow") is not None]
+    v["fcf_hist"] = fcf_hist
+    ttm = d.get("ttm", {}) or {}
+    v["fcf0"] = float(ttm.get("freeCashFlowTTM") or (fcf_hist[-1] if fcf_hist else 0))
+    if not v["fcf0"] and fcf_hist: v["fcf0"] = fcf_hist[-1]
+    def cagr(series):
+        s = [x for x in series if x and x > 0]
+        if len(s) >= 3: return (s[-1]/s[0])**(1/(len(s)-1)) - 1
+        return None
+    v["fcf_cagr"] = cagr(fcf_hist)
+    revs = [float(y["revenue"]) for y in reversed(inc) if y.get("revenue")]
+    v["rev_hist"] = revs
+    v["rev_cagr"] = cagr(revs)
+    eps  = [float(y["eps"]) for y in reversed(inc) if y.get("eps") is not None]
+    v["eps_hist"] = eps
+    v["eps_cagr"] = cagr([e for e in eps if e > 0]) if any(e > 0 for e in eps) else None
+    v["ni_hist"]  = [float(y.get("netIncome") or 0) for y in reversed(inc)]
+    v["shares_hist"] = [float(y.get("weightedAverageShsOutDil") or y.get("weightedAverageShsOut") or 0)
+                        for y in reversed(inc)]
+    return v
+
+def dcf_equity_value(fcf0, g1, wacc, terminal_g, net_debt, fade_years=5, growth_years=5):
+    """Two-stage DCF: growth_years at g1, then linear fade to terminal_g, plus terminal value."""
+    if fcf0 <= 0 or wacc <= terminal_g: return None, []
+    flows, fcf = [], fcf0
+    for yr in range(1, growth_years + 1):
+        fcf *= (1 + g1); flows.append(fcf)
+    for i in range(1, fade_years + 1):
+        g = g1 + (terminal_g - g1) * i / fade_years
+        fcf *= (1 + g); flows.append(fcf)
+    pv = sum(f / (1 + wacc) ** (i + 1) for i, f in enumerate(flows))
+    tv = flows[-1] * (1 + terminal_g) / (wacc - terminal_g)
+    pv += tv / (1 + wacc) ** len(flows)
+    return pv - net_debt, flows
+
+def reverse_dcf(price, shares, fcf0, wacc, terminal_g, net_debt):
+    """Bisection: what growth rate is priced in at the current market price?"""
+    if fcf0 <= 0 or not shares or not price: return None
+    target = price * shares
+    lo, hi = -0.10, 0.60
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        ev, _ = dcf_equity_value(fcf0, mid, wacc, terminal_g, net_debt)
+        if ev is None: return None
+        if ev < target: lo = mid
+        else: hi = mid
+    return (lo + hi) / 2
+
+def buffett_test(d, v):
+    """10-point Buffett quality checklist on real data. Returns (checks, score, max)."""
+    checks = []
+    met  = d.get("metrics6", []) or []
+    rat  = d.get("ratios", []) or []
+    inc  = d.get("income6", []) or []
+    def add(name, ok, detail):
+        checks.append({"check": name, "ok": ok, "detail": detail})
+    roics = []
+    for y in met:
+        r = y.get("returnOnInvestedCapital") or y.get("roic")
+        if r is not None: roics.append(float(r) * 100)
+    add("ROIC ≥ 15% (latest)", bool(roics) and roics[0] >= 15,
+        f"{roics[0]:.1f}%" if roics else "n/a")
+    add("ROIC ≥ 12% every year (consistency)", bool(roics) and len(roics) >= 3 and min(roics[:5]) >= 12,
+        f"min {min(roics[:5]):.1f}% over {min(len(roics),5)} yrs" if roics else "n/a")
+    gm = None
+    for y in rat[:1]:
+        g = y.get("grossProfitMargin") or y.get("grossMargin")
+        if g is not None: gm = float(g) * 100
+    if gm is None and inc:
+        rev, gp = inc[0].get("revenue"), inc[0].get("grossProfit")
+        if rev and gp: gm = gp / rev * 100
+    add("Gross margin ≥ 40% (pricing power)", gm is not None and gm >= 40,
+        f"{gm:.1f}%" if gm is not None else "n/a")
+    nm = None
+    if inc and inc[0].get("revenue"):
+        nm = float(inc[0].get("netIncome") or 0) / float(inc[0]["revenue"]) * 100
+    add("Net margin ≥ 15%", nm is not None and nm >= 15, f"{nm:.1f}%" if nm is not None else "n/a")
+    fm = None
+    if v["fcf_hist"] and v["rev_hist"]:
+        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
+    add("FCF margin ≥ 12%", fm is not None and fm >= 12, f"{fm:.1f}%" if fm is not None else "n/a")
+    de = d.get("metrics", [])
+    dv = None
+    for y in (de[:2] if isinstance(de, list) else []):
+        x = y.get("debtToEbitda") or y.get("netDebtToEBITDA")
+        if x is not None: dv = float(x); break
+    add("Debt/EBITDA ≤ 2.5x or net cash", dv is not None and dv <= 2.5,
+        f"{dv:.2f}x" if dv is not None else "n/a")
+    add("Revenue CAGR ≥ 8%", v["rev_cagr"] is not None and v["rev_cagr"] >= 0.08,
+        f"{v['rev_cagr']*100:.1f}%" if v["rev_cagr"] is not None else "n/a")
+    add("EPS growing over 5 yrs", v["eps_cagr"] is not None and v["eps_cagr"] > 0,
+        f"{v['eps_cagr']*100:.1f}% CAGR" if v["eps_cagr"] is not None else "n/a")
+    sh = [s for s in v["shares_hist"] if s > 0]
+    add("Share count flat or shrinking (buybacks)", len(sh) >= 3 and sh[-1] <= sh[0] * 1.02,
+        f"{(sh[-1]/sh[0]-1)*100:+.1f}% over {len(sh)} yrs" if len(sh) >= 3 else "n/a")
+    conv = None
+    if v["fcf_hist"] and v["ni_hist"] and v["ni_hist"][-1] > 0:
+        conv = v["fcf_hist"][-1] / v["ni_hist"][-1] * 100
+    add("FCF / Net Income ≥ 80% (earnings are real cash)", conv is not None and conv >= 80,
+        f"{conv:.0f}%" if conv is not None else "n/a")
+    score = sum(1 for c in checks if c["ok"])
+    return checks, score, len(checks)
+
+def lynch_classify(d, v, pe):
+    """Peter Lynch category + PEG verdict."""
+    g = v["eps_cagr"] if v["eps_cagr"] is not None else v["rev_cagr"]
+    g_pct = g * 100 if g is not None else None
+    mktcap = v["mktcap"]
+    sector = d.get("sector", "")
+    cyclical_sectors = ["Energy", "Basic Materials", "Consumer Cyclical", "Industrials", "Materials"]
+    eps = v["eps_hist"]
+    if eps and eps[-1] < 0 and len(eps) >= 2 and max(eps) > 0:
+        cat, note = "Turnaround", "Earnings currently negative after being positive — thesis depends on recovery, size positions small."
+    elif g_pct is None:
+        cat, note = "Unclassified", "Not enough growth history to classify."
+    elif g_pct >= 20:
+        cat, note = "Fast Grower", "Lynch's favourite — 20%+ growers. Watch for the growth fade; pay up only with a reasonable PEG."
+    elif g_pct >= 10:
+        cat = "Stalwart" if mktcap > 10e9 else "Mid-pace Grower"
+        note = "Solid 10-20% grower. Lynch expects 30-50% gains then rotate — do not expect a ten-bagger."
+    elif sector in cyclical_sectors:
+        cat, note = "Cyclical", "Earnings follow the economic cycle — low P/E can be a TOP not a bottom. Time the cycle, not the P/E."
+    else:
+        cat, note = "Slow Grower", "Sub-10% growth — only interesting for dividends. Rarely a fit for MCIS Tier 1."
+    peg = None
+    if pe and g_pct and g_pct > 0:
+        peg = pe / g_pct
+    if peg is None:            peg_verdict = "PEG unavailable"
+    elif peg <= 1.0:           peg_verdict = "PEG ≤ 1.0 — attractively priced for its growth (Lynch buy zone)"
+    elif peg <= 1.5:           peg_verdict = "PEG 1.0-1.5 — fairly priced"
+    elif peg <= 2.0:           peg_verdict = "PEG 1.5-2.0 — expensive, needs execution"
+    else:                      peg_verdict = "PEG > 2.0 — priced for perfection"
+    return cat, note, peg, peg_verdict, g_pct
+
+def moat_assessment(d, v):
+    """Quantitative moat evidence score 0-10."""
+    ev, score = [], 0
+    rat = d.get("ratios", []) or []
+    gms = []
+    for y in rat:
+        g = y.get("grossProfitMargin") or y.get("grossMargin")
+        if g is not None: gms.append(float(g) * 100)
+    if gms:
+        avg = sum(gms) / len(gms)
+        if avg >= 50: score += 2; ev.append(f"🟢 Avg gross margin {avg:.0f}% — strong pricing power (+2)")
+        elif avg >= 35: score += 1; ev.append(f"🟡 Avg gross margin {avg:.0f}% — decent (+1)")
+        else: ev.append(f"🔴 Avg gross margin {avg:.0f}% — weak pricing power (+0)")
+        if len(gms) >= 3 and (max(gms) - min(gms)) <= 6:
+            score += 1; ev.append(f"🟢 Margin stability — range only {max(gms)-min(gms):.1f} pts (+1)")
+    met = d.get("metrics6", []) or []
+    roics = [float(y.get("returnOnInvestedCapital") or y.get("roic") or 0) * 100
+             for y in met if (y.get("returnOnInvestedCapital") or y.get("roic")) is not None]
+    if roics:
+        if min(roics[:5]) >= 15 and len(roics) >= 3:
+            score += 3; ev.append(f"🟢 ROIC ≥ 15% every year for {min(len(roics),5)} yrs — durable advantage (+3)")
+        elif roics[0] >= 15:
+            score += 2; ev.append(f"🟡 ROIC {roics[0]:.0f}% now but not consistently (+2)")
+        elif roics[0] >= 10:
+            score += 1; ev.append(f"🟡 ROIC {roics[0]:.0f}% — average business (+1)")
+        else:
+            ev.append(f"🔴 ROIC {roics[0]:.0f}% — no evidence of moat (+0)")
+    if v["fcf_hist"] and v["rev_hist"]:
+        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
+        if fm >= 20: score += 2; ev.append(f"🟢 FCF margin {fm:.0f}% — cash machine (+2)")
+        elif fm >= 10: score += 1; ev.append(f"🟡 FCF margin {fm:.0f}% (+1)")
+        else: ev.append(f"🔴 FCF margin {fm:.0f}% (+0)")
+    if v["rev_cagr"] is not None and v["rev_cagr"] >= 0.10:
+        score += 2; ev.append(f"🟢 Revenue compounding at {v['rev_cagr']*100:.0f}% — moat is widening, not just defending (+2)")
+    rating = "WIDE MOAT" if score >= 8 else ("NARROW MOAT" if score >= 5 else "NO MOAT EVIDENCE")
+    return rating, score, ev
+
 # ─────────────────────────────────────────────
 # PAGE: DASHBOARD
 # ─────────────────────────────────────────────
+
 
 if page == "🏠 Dashboard":
     st.markdown("""
