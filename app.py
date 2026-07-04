@@ -207,6 +207,39 @@ def fetch_company(ticker):
         elif not isinstance(d["ttm"], dict):
             d["ttm"] = {}
 
+        # Extract FCF, shares, and net_debt for Fair Value calculation
+        try:
+            # FCF = Operating CF - CapEx (most recent year)
+            cf = d.get("cashflow", [])
+            if cf and isinstance(cf, list) and cf[0]:
+                ocf = cf[0].get("operatingCashFlow", 0)
+                capex = cf[0].get("capitalExpenditure", 0)
+                if ocf and capex:
+                    d["fcf"] = float(ocf) - abs(float(capex))
+        except:
+            pass
+        
+        try:
+            # Shares Outstanding
+            bal = d.get("ratios", [])
+            if bal and isinstance(bal, list) and bal[0]:
+                shares = bal[0].get("sharesOutstanding") or bal[0].get("commonStockSharesIssued")
+                if shares:
+                    d["shares"] = float(shares)
+        except:
+            pass
+        
+        try:
+            # Net Debt = Total Debt - Cash
+            ttm = d.get("ttm", {})
+            if ttm:
+                total_debt = ttm.get("totalDebt", 0)
+                cash = ttm.get("cashAndCashEquivalents", 0)
+                if total_debt is not None and cash is not None:
+                    d["net_debt"] = float(total_debt or 0) - float(cash or 0)
+        except:
+            pass
+
         d["ok"] = True
     except Exception as e:
         d["err"] = str(e)
@@ -295,6 +328,16 @@ def extract_metrics(d):
     if "pe" not in m:
         v = ttm.get("peRatioTTM")
         if v: m["pe"] = round(float(v),1)
+    
+    # Fallback: Calculate P/E from Price / EPS if not available
+    if "pe" not in m and d.get("price") and d.get("income"):
+        try:
+            price = float(d.get("price", 0))
+            eps = float(d.get("income", [{}])[0].get("eps", 0))
+            if price > 0 and eps > 0:
+                m["pe"] = round(price / eps, 1)
+        except:
+            pass
 
     # EV/EBITDA
     v = ttm.get("evToEbitdaTTM") or ttm.get("enterpriseValueOverEBITDATTM")
@@ -317,6 +360,10 @@ def run_filters(d):
         "sector":  d.get("sector","Unknown"),
         "price":   d.get("price",0),
         "mktcap":  d.get("mktcap",0),
+        # Add financial data for Fair Value calculation
+        "fcf":     d.get("fcf", 0),
+        "shares":  d.get("shares", 0),
+        "net_debt": d.get("net_debt", 0),
         "passed":  [], "failed": [], "warnings": [],
         "score":   0,  "metrics": {},
         "verdict": "", "layer":   "",
@@ -469,6 +516,38 @@ def results_to_df(results):
     for r in results:
         m = r.get("metrics",{})
         
+        # Calculate Fair Value (DCF base case) - simple version for rankings
+        fv = "N/A"
+        discount = "N/A"
+        try:
+            # Get available data
+            price = float(r.get("price", 0) or 0)
+            fcf = float(r.get("fcf", 0) or 0)
+            shares = float(r.get("shares", 0) or 0)
+            net_debt = float(r.get("net_debt", 0) or 0)
+            rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
+            
+            # Only calculate if we have minimum data
+            if fcf > 0 and shares > 0 and price > 0:
+                wacc = 0.08
+                tg = 0.025
+                g1 = min(max(rev_cagr, 0.04), 0.25)  # Growth rate 4-25%
+                
+                # 2-stage DCF
+                pv_stage1 = sum([fcf * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                fcf_year5 = fcf * ((1 + g1) ** 5)
+                fcf_year6 = fcf_year5 * (1 + tg)
+                tv = (fcf_year6 / (wacc - tg)) / ((1 + wacc) ** 5)
+                equity_value = (pv_stage1 + tv) - net_debt
+                fv_per_share = equity_value / shares
+                
+                if fv_per_share > 0:
+                    fv = f"${fv_per_share:,.0f}"
+                    discount_pct = ((fv_per_share - price) / price) * 100
+                    discount = f"{discount_pct:+.0f}%"
+        except:
+            pass
+        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -481,6 +560,8 @@ def results_to_df(results):
             "Debt/EB":   m.get("debt_ebitda","N/A"),
             "P/E":       m.get("pe","N/A"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
+            "Fair Value": fv,
+            "Discount":  discount,
             "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
             "Halal":     r.get("halal","?"),
         })
