@@ -211,33 +211,45 @@ def fetch_company(ticker):
         try:
             # FCF = Operating CF - CapEx (most recent year)
             cf = d.get("cashflow", [])
-            if cf and isinstance(cf, list) and cf[0]:
-                ocf = cf[0].get("operatingCashFlow", 0)
-                capex = cf[0].get("capitalExpenditure", 0)
-                if ocf and capex:
+            if cf and isinstance(cf, list) and len(cf) > 0 and isinstance(cf[0], dict):
+                ocf = cf[0].get("operatingCashFlow")
+                capex = cf[0].get("capitalExpenditure")
+                if ocf is not None and capex is not None:
                     d["fcf"] = float(ocf) - abs(float(capex))
-        except:
+        except Exception as e:
             pass
         
         try:
-            # Shares Outstanding
-            bal = d.get("ratios", [])
-            if bal and isinstance(bal, list) and bal[0]:
-                shares = bal[0].get("sharesOutstanding") or bal[0].get("commonStockSharesIssued")
+            # Shares Outstanding - try multiple field names
+            # Try from metrics first (TTM data is most reliable)
+            ttm_data = d.get("ttm", {})
+            if isinstance(ttm_data, dict):
+                shares = ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
                 if shares:
                     d["shares"] = float(shares)
-        except:
+            
+            # Fallback: try from metrics/ratios
+            if "shares" not in d:
+                met = d.get("metrics", [])
+                if met and isinstance(met, list) and len(met) > 0 and isinstance(met[0], dict):
+                    shares = met[0].get("numberOfShares") or met[0].get("sharesOutstanding") or met[0].get("commonStockSharesIssued")
+                    if shares:
+                        d["shares"] = float(shares)
+        except Exception as e:
             pass
         
         try:
-            # Net Debt = Total Debt - Cash
+            # Net Debt = Total Debt - Cash (use TTM for most recent)
             ttm = d.get("ttm", {})
-            if ttm:
-                total_debt = ttm.get("totalDebt", 0)
-                cash = ttm.get("cashAndCashEquivalents", 0)
+            if isinstance(ttm, dict):
+                total_debt = ttm.get("totalDebt") or ttm.get("totalLiabilities")
+                cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash")
+                
                 if total_debt is not None and cash is not None:
                     d["net_debt"] = float(total_debt or 0) - float(cash or 0)
-        except:
+                elif total_debt is not None:
+                    d["net_debt"] = float(total_debt or 0)
+        except Exception as e:
             pass
 
         d["ok"] = True
@@ -520,32 +532,32 @@ def results_to_df(results):
         fv = "N/A"
         discount = "N/A"
         try:
-            # Get available data
-            price = float(r.get("price", 0) or 0)
-            fcf = float(r.get("fcf", 0) or 0)
-            shares = float(r.get("shares", 0) or 0)
-            net_debt = float(r.get("net_debt", 0) or 0)
-            rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
+            # Get available data with explicit type conversion
+            price = float(r.get("price") or 0)
+            fcf = float(r.get("fcf") or 0)
+            shares = float(r.get("shares") or 0)
+            net_debt = float(r.get("net_debt") or 0)
+            rev_cagr = float(m.get("rev_cagr") or 0) / 100
             
-            # Only calculate if we have minimum data
-            if fcf > 0 and shares > 0 and price > 0:
+            # Only calculate if we have MINIMUM viable data
+            if price > 0 and fcf > 100000 and shares > 0 and rev_cagr > 0:  # FCF in $
                 wacc = 0.08
                 tg = 0.025
                 g1 = min(max(rev_cagr, 0.04), 0.25)  # Growth rate 4-25%
                 
                 # 2-stage DCF
-                pv_stage1 = sum([fcf * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
-                fcf_year5 = fcf * ((1 + g1) ** 5)
-                fcf_year6 = fcf_year5 * (1 + tg)
-                tv = (fcf_year6 / (wacc - tg)) / ((1 + wacc) ** 5)
-                equity_value = (pv_stage1 + tv) - net_debt
-                fv_per_share = equity_value / shares
+                pv_s1 = sum([fcf * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
+                fcf_yr5 = fcf * ((1 + g1) ** 5)
+                fcf_yr6 = fcf_yr5 * (1 + tg)
+                tv = (fcf_yr6 / (wacc - tg)) / ((1 + wacc) ** 5)
+                eq_val = (pv_s1 + tv) - net_debt
+                fv_ps = eq_val / shares
                 
-                if fv_per_share > 0:
-                    fv = f"${fv_per_share:,.0f}"
-                    discount_pct = ((fv_per_share - price) / price) * 100
-                    discount = f"{discount_pct:+.0f}%"
-        except:
+                if fv_ps > 1:  # Only show if reasonable
+                    fv = f"${fv_ps:,.0f}"
+                    disc = ((fv_ps - price) / price) * 100
+                    discount = f"{disc:+.0f}%"
+        except Exception as e:
             pass
         
         rows.append({
