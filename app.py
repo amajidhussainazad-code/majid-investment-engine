@@ -519,6 +519,7 @@ def results_to_df(results):
             "Debt/EB":   m.get("debt_ebitda","N/A"),
             "P/E":       m.get("pe","N/A"),
             "Price":     f"${r['price']:,.2f}" if r.get('price') else "N/A",
+            "Mkt Cap":   fmt_mktcap(r.get("mktcap",0)),
             "Fair Value": fv,
             "Discount":  discount,
             "Halal":     r.get("halal","?"),
