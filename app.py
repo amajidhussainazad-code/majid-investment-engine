@@ -141,7 +141,11 @@ st.markdown("""
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-API_KEY = "EBgvBcpXZ972yqnngUEMujYeBuk2cPZy"
+# API key — reads from Streamlit Cloud Secrets if set (recommended), else falls back
+try:
+    API_KEY = st.secrets["FMP_API_KEY"]
+except Exception:
+    API_KEY = "EBgvBcpXZ972yqnngUEMujYeBuk2cPZy"
 BASE    = "https://financialmodelingprep.com/stable"
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
@@ -378,6 +382,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["🏠 Dashboard", "🔍 Scanner", "📊 Rankings", "🔎 Company Lookup",
+         "🏛 Valuation Engine", "🚨 Qualitative Alerts",
          "📋 Watchlist", "⚡ Swing Trades", "📅 Quarterly Review"],
         label_visibility="collapsed"
     )
@@ -964,3 +969,643 @@ elif page == "📅 Quarterly Review":
             st.warning("Some checklist items are incomplete. Review them before finalising.")
 
 # This line intentionally left blank
+
+# ═════════════════════════════════════════════
+# QUALITATIVE ALERT SYSTEM — engine
+# FMP stable: news, insider trading + SEC EDGAR fallback
+# ═════════════════════════════════════════════
+
+CRITICAL_KW = ["sec investigation","doj","fraud","subpoena","restatement","restate",
+               "bankruptcy","chapter 11","delisting","going concern","resigns","resignation",
+               "steps down","stepping down","abrupt departure","cuts guidance","lowers guidance",
+               "slashes guidance","withdraws guidance","accounting irregular","short seller report",
+               "material weakness","default","criminal"]
+WARNING_KW  = ["lawsuit","class action","layoffs","job cuts","downgrade","downgrades",
+               "misses estimates","earnings miss","revenue miss","data breach","cyberattack",
+               "recall","probe","investigation","fine","penalty","antitrust","strike",
+               "dilution","secondary offering","insider selling","warns","profit warning",
+               "loses contract","delay","halted"]
+POSITIVE_KW = ["beats estimates","raises guidance","upgrade","upgrades","buyback",
+               "share repurchase","new contract","partnership","fda approval","record revenue",
+               "dividend increase","insider buying","acquisition of","expands"]
+
+FILING_SEVERITY = {
+    "NT 10-K": ("CRITICAL", "Late annual report — potential accounting problem"),
+    "NT 10-Q": ("CRITICAL", "Late quarterly report — potential accounting problem"),
+    "8-K":     ("INFO",     "Material event disclosure — read what changed"),
+    "SC 13D":  ("INFO",     "Activist/large investor stake above 5%"),
+    "SC 13G":  ("INFO",     "Passive large investor stake above 5%"),
+    "S-1":     ("WARNING",  "New share registration — possible dilution"),
+    "S-3":     ("WARNING",  "Shelf registration — possible future dilution"),
+    "424B":    ("WARNING",  "Prospectus — share offering in progress"),
+    "10-K":    ("INFO",     "Annual report filed"),
+    "10-Q":    ("INFO",     "Quarterly report filed"),
+    "DEF 14A": ("INFO",     "Proxy statement — check executive pay and votes"),
+}
+
+def classify_headline(title):
+    t = (title or "").lower()
+    for k in CRITICAL_KW:
+        if k in t: return "CRITICAL", k
+    for k in WARNING_KW:
+        if k in t: return "WARNING", k
+    for k in POSITIVE_KW:
+        if k in t: return "POSITIVE", k
+    return None, None
+
+def fetch_news(ticker, days=30):
+    frm = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    raw = fmp_get("news/stock", {"symbols": ticker, "from": frm,
+                                 "to": datetime.now().strftime("%Y-%m-%d"), "limit": 50})
+    return raw if isinstance(raw, list) else []
+
+def fetch_insiders(ticker, days=90):
+    raw = fmp_get("insider-trading/search", {"symbol": ticker, "page": 0, "limit": 100})
+    if not isinstance(raw, list): return []
+    cutoff = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    out = []
+    for t in raw:
+        d = t.get("transactionDate") or t.get("filingDate") or ""
+        if d and d >= cutoff: out.append(t)
+    return out
+
+@st.cache_data(ttl=86400)
+def _edgar_cik_map():
+    try:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                         headers={"User-Agent": "MCIS research mcis@example.com"}, timeout=15)
+        data = r.json()
+        return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in data.values()}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=3600)
+def fetch_filings(ticker, days=90):
+    """SEC filings — FMP stable first, direct SEC EDGAR as fallback."""
+    frm = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    to  = datetime.now().strftime("%Y-%m-%d")
+    raw = fmp_get("sec-filings-search/symbol",
+                  {"symbol": ticker, "from": frm, "to": to, "page": 0, "limit": 100})
+    filings = []
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "Error" not in str(raw[0])[:60]:
+        for f in raw:
+            form = f.get("formType") or f.get("type") or ""
+            if form:
+                filings.append({"form": form,
+                                "date": (f.get("filingDate") or f.get("acceptedDate") or "")[:10],
+                                "link": f.get("finalLink") or f.get("link") or ""})
+    if not filings:  # EDGAR direct fallback
+        cik = _edgar_cik_map().get(ticker.upper())
+        if cik:
+            try:
+                r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                                 headers={"User-Agent": "MCIS research mcis@example.com"}, timeout=15)
+                rec = r.json().get("filings", {}).get("recent", {})
+                for form, date, acc, doc in zip(rec.get("form", []), rec.get("filingDate", []),
+                                                rec.get("accessionNumber", []), rec.get("primaryDocument", [])):
+                    if date >= frm:
+                        acc2 = acc.replace("-", "")
+                        filings.append({"form": form, "date": date,
+                                        "link": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc2}/{doc}"})
+            except Exception:
+                pass
+    return filings
+
+def analyze_insiders(trades):
+    """Cluster analysis of insider activity — returns summary + alerts."""
+    alerts, sells, buys = [], [], []
+    sell_val = buy_val = 0.0
+    for t in trades:
+        typ = (t.get("transactionType") or "").upper()
+        ad  = (t.get("acquisitionOrDisposition") or "").upper()
+        qty = float(t.get("securitiesTransacted") or 0)
+        px  = float(t.get("price") or 0)
+        val = qty * px
+        if typ.startswith("S") or ad == "D":
+            sells.append(t); sell_val += val
+        elif typ.startswith("P") or ad == "A":
+            buys.append(t); buy_val += val
+    exec_sells = [t for t in sells if any(k in (t.get("typeOfOwner") or "").lower()
+                  for k in ["chief executive","ceo","chief financial","cfo","president"])]
+    if len(sells) >= 4:
+        alerts.append(("WARNING", f"Cluster selling — {len(sells)} insider sales in 90 days (${sell_val/1e6:.1f}M)"))
+    if any(float(t.get("securitiesTransacted") or 0)*float(t.get("price") or 0) > 5_000_000 for t in exec_sells):
+        alerts.append(("WARNING", "CEO/CFO sale above $5M in the last 90 days"))
+    if buy_val > 1_000_000 and buy_val > sell_val:
+        alerts.append(("POSITIVE", f"Net insider BUYING — ${buy_val/1e6:.1f}M bought vs ${sell_val/1e6:.1f}M sold"))
+    return {"n_sells": len(sells), "n_buys": len(buys),
+            "sell_val": sell_val, "buy_val": buy_val, "alerts": alerts}
+
+def run_alert_scan(tickers, news_days=30, insider_days=90, filing_days=60):
+    out = {}
+    for tk in tickers:
+        entry = {"news_alerts": [], "insider": {}, "filing_alerts": [], "all": []}
+        # News
+        for n in fetch_news(tk, news_days):
+            title = n.get("title") or ""
+            sev, kw = classify_headline(title)
+            if sev:
+                a = {"sev": sev, "src": "NEWS", "date": (n.get("publishedDate") or "")[:10],
+                     "text": title, "why": f"keyword: {kw}", "link": n.get("url") or ""}
+                entry["news_alerts"].append(a); entry["all"].append(a)
+        # Insiders
+        ins = analyze_insiders(fetch_insiders(tk, insider_days))
+        entry["insider"] = ins
+        for sev, msg in ins["alerts"]:
+            a = {"sev": sev, "src": "INSIDER", "date": "", "text": msg, "why": "", "link": ""}
+            entry["all"].append(a)
+        # SEC filings
+        for f in fetch_filings(tk, filing_days):
+            for prefix, (sev, why) in FILING_SEVERITY.items():
+                if f["form"].upper().startswith(prefix):
+                    a = {"sev": sev, "src": "SEC", "date": f["date"],
+                         "text": f"{f['form']} filed", "why": why, "link": f["link"]}
+                    entry["filing_alerts"].append(a); entry["all"].append(a)
+                    break
+        out[tk] = entry
+    return out
+
+# ═════════════════════════════════════════════
+# VALUATION ENGINE — DCF, Reverse DCF, Buffett,
+# Lynch classification, Moat assessment
+# ═════════════════════════════════════════════
+
+def fetch_valuation_data(ticker):
+    d = fetch_company(ticker)
+    if not d.get("ok"): return d
+    d["income6"]   = fmp_get("income-statement",     {"symbol": ticker, "period": "annual", "limit": 6})
+    d["cashflow6"] = fmp_get("cash-flow-statement",  {"symbol": ticker, "period": "annual", "limit": 6})
+    d["balance"]   = fmp_get("balance-sheet-statement", {"symbol": ticker, "period": "annual", "limit": 2})
+    q = fmp_get("quote", {"symbol": ticker})
+    d["quote"] = q[0] if isinstance(q, list) and q else {}
+    d["metrics6"]  = fmp_get("key-metrics", {"symbol": ticker, "period": "annual", "limit": 6})
+    return d
+
+def _val_inputs(d):
+    """Extract the raw numbers the valuation engine needs."""
+    v = {}
+    q   = d.get("quote", {})
+    bal = d.get("balance", []) or []
+    cf  = d.get("cashflow6", []) or []
+    inc = d.get("income6", []) or []
+    v["price"]  = float(q.get("price") or d.get("price") or 0)
+    v["shares"] = float(q.get("sharesOutstanding") or 0)
+    if not v["shares"] and v["price"] and d.get("mktcap"):
+        v["shares"] = d["mktcap"] / v["price"]
+    v["mktcap"] = float(q.get("marketCap") or d.get("mktcap") or 0)
+    b0 = bal[0] if bal else {}
+    cash = float(b0.get("cashAndShortTermInvestments") or b0.get("cashAndCashEquivalents") or 0)
+    debt = float(b0.get("totalDebt") or 0)
+    v["net_debt"] = debt - cash
+    # FCF history (oldest→newest)
+    fcf_hist = [float(y["freeCashFlow"]) for y in reversed(cf) if y.get("freeCashFlow") is not None]
+    v["fcf_hist"] = fcf_hist
+    ttm = d.get("ttm", {}) or {}
+    v["fcf0"] = float(ttm.get("freeCashFlowTTM") or (fcf_hist[-1] if fcf_hist else 0))
+    if not v["fcf0"] and fcf_hist: v["fcf0"] = fcf_hist[-1]
+    # historical growth rates
+    def cagr(series):
+        s = [x for x in series if x and x > 0]
+        if len(s) >= 3: return (s[-1]/s[0])**(1/(len(s)-1)) - 1
+        return None
+    v["fcf_cagr"] = cagr(fcf_hist)
+    revs = [float(y["revenue"]) for y in reversed(inc) if y.get("revenue")]
+    v["rev_hist"] = revs
+    v["rev_cagr"] = cagr(revs)
+    eps  = [float(y["eps"]) for y in reversed(inc) if y.get("eps") is not None]
+    v["eps_hist"] = eps
+    v["eps_cagr"] = cagr([e for e in eps if e > 0]) if any(e > 0 for e in eps) else None
+    v["ni_hist"]  = [float(y.get("netIncome") or 0) for y in reversed(inc)]
+    v["shares_hist"] = [float(y.get("weightedAverageShsOutDil") or y.get("weightedAverageShsOut") or 0)
+                        for y in reversed(inc)]
+    return v
+
+def dcf_equity_value(fcf0, g1, wacc, terminal_g, net_debt, fade_years=5, growth_years=5):
+    """Two-stage DCF: growth_years at g1, then linear fade to terminal_g, plus terminal value."""
+    if fcf0 <= 0 or wacc <= terminal_g: return None, []
+    flows, fcf = [], fcf0
+    for yr in range(1, growth_years + 1):
+        fcf *= (1 + g1); flows.append(fcf)
+    for i in range(1, fade_years + 1):
+        g = g1 + (terminal_g - g1) * i / fade_years
+        fcf *= (1 + g); flows.append(fcf)
+    pv = sum(f / (1 + wacc) ** (i + 1) for i, f in enumerate(flows))
+    tv = flows[-1] * (1 + terminal_g) / (wacc - terminal_g)
+    pv += tv / (1 + wacc) ** len(flows)
+    return pv - net_debt, flows
+
+def reverse_dcf(price, shares, fcf0, wacc, terminal_g, net_debt):
+    """Bisection: what growth rate is priced in at the current market price?"""
+    if fcf0 <= 0 or not shares or not price: return None
+    target = price * shares
+    lo, hi = -0.10, 0.60
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        ev, _ = dcf_equity_value(fcf0, mid, wacc, terminal_g, net_debt)
+        if ev is None: return None
+        if ev < target: lo = mid
+        else: hi = mid
+    return (lo + hi) / 2
+
+def buffett_test(d, v):
+    """10-point Buffett quality checklist on real data. Returns (checks, score, max)."""
+    checks = []
+    met  = d.get("metrics6", []) or []
+    rat  = d.get("ratios", []) or []
+    inc  = d.get("income6", []) or []
+    def add(name, ok, detail):
+        checks.append({"check": name, "ok": ok, "detail": detail})
+    # 1-2 ROIC level and consistency
+    roics = []
+    for y in met:
+        r = y.get("returnOnInvestedCapital") or y.get("roic")
+        if r is not None: roics.append(float(r) * 100)
+    add("ROIC ≥ 15% (latest)", bool(roics) and roics[0] >= 15,
+        f"{roics[0]:.1f}%" if roics else "n/a")
+    add("ROIC ≥ 12% every year (consistency)", bool(roics) and len(roics) >= 3 and min(roics[:5]) >= 12,
+        f"min {min(roics[:5]):.1f}% over {min(len(roics),5)} yrs" if roics else "n/a")
+    # 3 Gross margin
+    gm = None
+    for y in rat[:1]:
+        g = y.get("grossProfitMargin") or y.get("grossMargin")
+        if g is not None: gm = float(g) * 100
+    if gm is None and inc:
+        rev, gp = inc[0].get("revenue"), inc[0].get("grossProfit")
+        if rev and gp: gm = gp / rev * 100
+    add("Gross margin ≥ 40% (pricing power)", gm is not None and gm >= 40,
+        f"{gm:.1f}%" if gm is not None else "n/a")
+    # 4 Net margin
+    nm = None
+    if inc and inc[0].get("revenue"):
+        nm = float(inc[0].get("netIncome") or 0) / float(inc[0]["revenue"]) * 100
+    add("Net margin ≥ 15%", nm is not None and nm >= 15, f"{nm:.1f}%" if nm is not None else "n/a")
+    # 5 FCF margin
+    fm = None
+    if v["fcf_hist"] and v["rev_hist"]:
+        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
+    add("FCF margin ≥ 12%", fm is not None and fm >= 12, f"{fm:.1f}%" if fm is not None else "n/a")
+    # 6 Debt
+    de = d.get("metrics", [])
+    dv = None
+    for y in (de[:2] if isinstance(de, list) else []):
+        x = y.get("debtToEbitda") or y.get("netDebtToEBITDA")
+        if x is not None: dv = float(x); break
+    add("Debt/EBITDA ≤ 2.5x or net cash", dv is not None and dv <= 2.5,
+        f"{dv:.2f}x" if dv is not None else "n/a")
+    # 7 Revenue growth
+    add("Revenue CAGR ≥ 8%", v["rev_cagr"] is not None and v["rev_cagr"] >= 0.08,
+        f"{v['rev_cagr']*100:.1f}%" if v["rev_cagr"] is not None else "n/a")
+    # 8 EPS growth
+    add("EPS growing over 5 yrs", v["eps_cagr"] is not None and v["eps_cagr"] > 0,
+        f"{v['eps_cagr']*100:.1f}% CAGR" if v["eps_cagr"] is not None else "n/a")
+    # 9 Share count
+    sh = [s for s in v["shares_hist"] if s > 0]
+    add("Share count flat or shrinking (buybacks)", len(sh) >= 3 and sh[-1] <= sh[0] * 1.02,
+        f"{(sh[-1]/sh[0]-1)*100:+.1f}% over {len(sh)} yrs" if len(sh) >= 3 else "n/a")
+    # 10 FCF conversion
+    conv = None
+    if v["fcf_hist"] and v["ni_hist"] and v["ni_hist"][-1] > 0:
+        conv = v["fcf_hist"][-1] / v["ni_hist"][-1] * 100
+    add("FCF / Net Income ≥ 80% (earnings are real cash)", conv is not None and conv >= 80,
+        f"{conv:.0f}%" if conv is not None else "n/a")
+    score = sum(1 for c in checks if c["ok"])
+    return checks, score, len(checks)
+
+def lynch_classify(d, v, pe):
+    """Peter Lynch category + PEG verdict."""
+    g = v["eps_cagr"] if v["eps_cagr"] is not None else v["rev_cagr"]
+    g_pct = g * 100 if g is not None else None
+    mktcap = v["mktcap"]
+    sector = d.get("sector", "")
+    cyclical_sectors = ["Energy", "Basic Materials", "Consumer Cyclical", "Industrials", "Materials"]
+    eps = v["eps_hist"]
+    if eps and eps[-1] < 0 and len(eps) >= 2 and max(eps) > 0:
+        cat, note = "Turnaround", "Earnings currently negative after being positive — thesis depends on recovery, size positions small."
+    elif g_pct is None:
+        cat, note = "Unclassified", "Not enough growth history to classify."
+    elif g_pct >= 20:
+        cat, note = "Fast Grower", "Lynch's favourite — 20%+ growers. Watch for the growth fade; pay up only with a reasonable PEG."
+    elif g_pct >= 10:
+        cat = "Stalwart" if mktcap > 10e9 else "Mid-pace Grower"
+        note = "Solid 10-20% grower. Lynch expects 30-50% gains then rotate — do not expect a ten-bagger."
+    elif sector in cyclical_sectors:
+        cat, note = "Cyclical", "Earnings follow the economic cycle — low P/E can be a TOP not a bottom. Time the cycle, not the P/E."
+    else:
+        cat, note = "Slow Grower", "Sub-10% growth — only interesting for dividends. Rarely a fit for MCIS Tier 1."
+    peg = None
+    if pe and g_pct and g_pct > 0:
+        peg = pe / g_pct
+    if peg is None:            peg_verdict = "PEG unavailable"
+    elif peg <= 1.0:           peg_verdict = "PEG ≤ 1.0 — attractively priced for its growth (Lynch buy zone)"
+    elif peg <= 1.5:           peg_verdict = "PEG 1.0-1.5 — fairly priced"
+    elif peg <= 2.0:           peg_verdict = "PEG 1.5-2.0 — expensive, needs execution"
+    else:                      peg_verdict = "PEG > 2.0 — priced for perfection"
+    return cat, note, peg, peg_verdict, g_pct
+
+def moat_assessment(d, v):
+    """Quantitative moat evidence score 0-10 → None / Narrow / Wide."""
+    ev, score = [], 0
+    rat = d.get("ratios", []) or []
+    gms = []
+    for y in rat:
+        g = y.get("grossProfitMargin") or y.get("grossMargin")
+        if g is not None: gms.append(float(g) * 100)
+    if gms:
+        avg = sum(gms) / len(gms)
+        if avg >= 50: score += 2; ev.append(f"🟢 Avg gross margin {avg:.0f}% — strong pricing power (+2)")
+        elif avg >= 35: score += 1; ev.append(f"🟡 Avg gross margin {avg:.0f}% — decent (+1)")
+        else: ev.append(f"🔴 Avg gross margin {avg:.0f}% — weak pricing power (+0)")
+        if len(gms) >= 3 and (max(gms) - min(gms)) <= 6:
+            score += 1; ev.append(f"🟢 Margin stability — range only {max(gms)-min(gms):.1f} pts (+1)")
+    met = d.get("metrics6", []) or []
+    roics = [float(y.get("returnOnInvestedCapital") or y.get("roic") or 0) * 100
+             for y in met if (y.get("returnOnInvestedCapital") or y.get("roic")) is not None]
+    if roics:
+        if min(roics[:5]) >= 15 and len(roics) >= 3:
+            score += 3; ev.append(f"🟢 ROIC ≥ 15% every year for {min(len(roics),5)} yrs — durable advantage (+3)")
+        elif roics[0] >= 15:
+            score += 2; ev.append(f"🟡 ROIC {roics[0]:.0f}% now but not consistently (+2)")
+        elif roics[0] >= 10:
+            score += 1; ev.append(f"🟡 ROIC {roics[0]:.0f}% — average business (+1)")
+        else:
+            ev.append(f"🔴 ROIC {roics[0]:.0f}% — no evidence of moat (+0)")
+    if v["fcf_hist"] and v["rev_hist"]:
+        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
+        if fm >= 20: score += 2; ev.append(f"🟢 FCF margin {fm:.0f}% — cash machine (+2)")
+        elif fm >= 10: score += 1; ev.append(f"🟡 FCF margin {fm:.0f}% (+1)")
+        else: ev.append(f"🔴 FCF margin {fm:.0f}% (+0)")
+    if v["rev_cagr"] is not None and v["rev_cagr"] >= 0.10:
+        score += 2; ev.append(f"🟢 Revenue compounding at {v['rev_cagr']*100:.0f}% — moat is widening, not just defending (+2)")
+    rating = "WIDE MOAT" if score >= 8 else ("NARROW MOAT" if score >= 5 else "NO MOAT EVIDENCE")
+    return rating, score, ev
+
+# ─────────────────────────────────────────────
+# PAGE: VALUATION ENGINE
+# ─────────────────────────────────────────────
+
+if page == "🏛 Valuation Engine":
+    st.markdown("""
+    <div class="mcis-header">
+        <p class="mcis-title">🏛 Valuation Engine</p>
+        <p class="mcis-subtitle">DCF | Reverse DCF | Buffett Quality Test | Lynch Classification | Moat Assessment</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        val_ticker = st.text_input("Ticker symbol", placeholder="e.g. NVDA", key="val_ticker_in").upper().strip()
+    with c2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load = st.button("📥 Load Company")
+
+    if load and val_ticker:
+        with st.spinner(f"Fetching 6 years of financials for {val_ticker}..."):
+            vd = fetch_valuation_data(val_ticker)
+        if not vd.get("ok"):
+            st.error(f"Could not fetch data for {val_ticker}. Check the ticker.")
+        else:
+            st.session_state["val_data"] = vd
+
+    vd = st.session_state.get("val_data")
+    if vd and vd.get("ok"):
+        v = _val_inputs(vd)
+        result = run_filters(vd)
+        m = result.get("metrics", {})
+        pe = m.get("pe")
+
+        st.subheader(f"{vd['ticker']} — {vd.get('name','')}")
+        st.caption(f"{vd.get('sector','')} | {vd.get('industry','')} | Price ${v['price']:,.2f} | "
+                   f"Mkt Cap {fmt_mktcap(v['mktcap'])} | MCIS Score {result['score']}/100 ({result['verdict']})")
+
+        if v["fcf0"] <= 0:
+            st.markdown('<div class="warning-box"><b>FCF is negative or unavailable</b> — a DCF is not meaningful. '
+                        'The quality, Lynch and moat sections below still work.</div>', unsafe_allow_html=True)
+
+        # ── DCF assumptions ──
+        st.markdown('<div class="section-header">⚙️ DCF Assumptions — adjust and everything recalculates live</div>', unsafe_allow_html=True)
+        hist_g = v["fcf_cagr"] if v["fcf_cagr"] is not None else v["rev_cagr"]
+        default_g = int(round(min(max((hist_g or 0.10) * 100, 4), 25)))
+        a1, a2, a3, a4 = st.columns(4)
+        with a1: g1  = st.slider("Growth yrs 1-5 (%)", -5, 40, default_g) / 100
+        with a2: wacc = st.slider("Discount rate (%)", 6.0, 15.0, 10.0, 0.5) / 100
+        with a3: tg  = st.slider("Terminal growth (%)", 1.0, 4.0, 2.5, 0.25) / 100
+        with a4: mos_req = st.slider("Required margin of safety (%)", 10, 50, 25, 5)
+        _fcf_c = f"{v['fcf_cagr']*100:.1f}%" if v['fcf_cagr'] is not None else "n/a"
+        _rev_c = f"{v['rev_cagr']*100:.1f}%" if v['rev_cagr'] is not None else "n/a"
+        st.caption(f"Historical FCF CAGR: {_fcf_c} | Revenue CAGR: {_rev_c} | "
+                   f"FCF base (TTM): ${v['fcf0']/1e9:.2f}B | Net debt: ${v['net_debt']/1e9:.2f}B")
+
+        if v["fcf0"] > 0 and v["shares"]:
+            scenarios = {
+                "🐻 Bear":  max(g1 * 0.6, -0.05),
+                "⚖️ Base":  g1,
+                "🚀 Bull":  min(g1 * 1.3, 0.40),
+            }
+            rows, per_share = [], {}
+            for name, g in scenarios.items():
+                eq, _ = dcf_equity_value(v["fcf0"], g, wacc, tg, v["net_debt"])
+                ps = eq / v["shares"] if eq else 0
+                per_share[name] = ps
+                mos = (1 - v["price"] / ps) * 100 if ps > 0 else -999
+                rows.append({"Scenario": name, "FCF growth": f"{g*100:.1f}%",
+                             "Intrinsic value/share": f"${ps:,.2f}",
+                             "vs Price": f"{(ps/v['price']-1)*100:+.1f}%" if v['price'] else "n/a",
+                             "Margin of safety": f"{mos:.1f}%" if mos > -999 else "n/a"})
+
+            st.markdown('<div class="section-header">💰 DCF — Three Scenario Intrinsic Value</div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            # Football field chart
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            colors_map = {"🐻 Bear": "#e65100", "⚖️ Base": "#1a3c5e", "🚀 Bull": "#1b5e20"}
+            for name, ps in per_share.items():
+                fig.add_trace(go.Bar(x=[ps], y=[name], orientation="h",
+                                     marker_color=colors_map[name], text=f"${ps:,.0f}",
+                                     textposition="outside", showlegend=False))
+            fig.add_vline(x=v["price"], line_dash="dash", line_color="#c9a84c", line_width=3,
+                          annotation_text=f"Price ${v['price']:,.0f}", annotation_position="top")
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10),
+                              xaxis_title="Value per share ($)", plot_bgcolor="white")
+            st.plotly_chart(fig, use_container_width=True)
+
+            base_ps = per_share["⚖️ Base"]
+            base_mos = (1 - v["price"] / base_ps) * 100 if base_ps > 0 else -999
+            if base_mos >= mos_req:
+                st.success(f"✅ BUY ZONE — base case margin of safety {base_mos:.0f}% meets your {mos_req}% requirement. "
+                           f"Buy-below price: ${base_ps*(1-mos_req/100):,.2f}")
+            elif base_mos > 0:
+                st.warning(f"⚠️ UNDERVALUED BUT THIN — {base_mos:.0f}% margin of safety is below your {mos_req}% requirement. "
+                           f"Target entry: ${base_ps*(1-mos_req/100):,.2f}")
+            else:
+                st.error(f"❌ ABOVE INTRINSIC VALUE — price exceeds base case by {-base_mos:.0f}%. "
+                         f"Target entry: ${base_ps*(1-mos_req/100):,.2f}")
+
+            # Reverse DCF
+            st.markdown('<div class="section-header">🔄 Reverse DCF — what the market is pricing in</div>', unsafe_allow_html=True)
+            implied = reverse_dcf(v["price"], v["shares"], v["fcf0"], wacc, tg, v["net_debt"])
+            if implied is not None:
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Implied FCF growth (yrs 1-5)", f"{implied*100:.1f}%")
+                r2.metric("Historical FCF CAGR", f"{v['fcf_cagr']*100:.1f}%" if v['fcf_cagr'] is not None else "n/a")
+                r3.metric("Your base assumption", f"{g1*100:.1f}%")
+                if v["fcf_cagr"] is not None:
+                    if implied > v["fcf_cagr"] * 1.2:
+                        st.error(f"Market demands {implied*100:.1f}% growth — MORE than the company has historically delivered "
+                                 f"({v['fcf_cagr']*100:.1f}%). The stock is priced for acceleration.")
+                    elif implied < v["fcf_cagr"] * 0.7:
+                        st.success(f"Market only demands {implied*100:.1f}% — LESS than historical {v['fcf_cagr']*100:.1f}%. "
+                                   "Expectations are beatable — this is where mispricing lives.")
+                    else:
+                        st.info(f"Market expects {implied*100:.1f}% — roughly in line with history. Fairly priced on growth.")
+            else:
+                st.info("Reverse DCF unavailable (needs positive FCF and share count).")
+
+        # ── Buffett Quality Test ──
+        st.markdown('<div class="section-header">🎩 Buffett Quality Test — 10 checks</div>', unsafe_allow_html=True)
+        checks, score, mx = buffett_test(vd, v)
+        b1, b2 = st.columns([1, 3])
+        with b1:
+            st.metric("Quality Score", f"{score}/{mx}")
+            if score >= 8:   st.success("WONDERFUL COMPANY")
+            elif score >= 6: st.info("GOOD COMPANY")
+            elif score >= 4: st.warning("AVERAGE")
+            else:            st.error("AVOID — quality too low")
+        with b2:
+            for c in checks:
+                (st.success if c["ok"] else st.error)(f"{'✓' if c['ok'] else '✗'} {c['check']} — {c['detail']}")
+
+        # ── Lynch Classification ──
+        st.markdown('<div class="section-header">📈 Peter Lynch Classification</div>', unsafe_allow_html=True)
+        cat, note, peg, peg_verdict, g_pct = lynch_classify(vd, v, pe)
+        l1, l2, l3 = st.columns(3)
+        l1.metric("Category", cat)
+        l2.metric("Growth rate", f"{g_pct:.1f}%" if g_pct is not None else "n/a")
+        l3.metric("PEG ratio", f"{peg:.2f}" if peg is not None else "n/a")
+        st.info(f"**{cat}** — {note}")
+        if peg is not None:
+            (st.success if peg <= 1.5 else st.warning if peg <= 2 else st.error)(peg_verdict)
+
+        # ── Moat Assessment ──
+        st.markdown('<div class="section-header">🏰 Moat Assessment</div>', unsafe_allow_html=True)
+        rating, mscore, evidence = moat_assessment(vd, v)
+        mo1, mo2 = st.columns([1, 3])
+        with mo1:
+            st.metric("Moat Evidence Score", f"{mscore}/10")
+            if rating == "WIDE MOAT":    st.success(f"🏰 {rating}")
+            elif rating == "NARROW MOAT": st.info(f"🛡️ {rating}")
+            else:                         st.error(f"⚠️ {rating}")
+        with mo2:
+            for e in evidence: st.write(e)
+        with st.expander("📝 Qualitative moat checklist — your judgement, not the data's"):
+            st.caption("Numbers show a moat EXISTS. These questions identify WHAT it is. Tick what genuinely applies:")
+            for q in ["Network effects — does each new customer make the product better for others?",
+                      "Switching costs — is it painful/expensive for customers to leave?",
+                      "Intangibles — brand, patents or licences competitors cannot copy?",
+                      "Cost advantage — can it produce cheaper than anyone else at scale?",
+                      "Efficient scale — is the market only big enough for a few players?"]:
+                st.checkbox(q, key=f"moat_{vd['ticker']}_{q[:20]}")
+
+        st.caption("MCIS Valuation Engine | Blueprint v1.1 | Models, not predictions — not investment advice")
+    else:
+        st.markdown('<div class="info-box">Enter a ticker and click <b>Load Company</b>. '
+                    'The engine fetches 6 years of financials once, then every slider recalculates the DCF instantly.</div>',
+                    unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# PAGE: QUALITATIVE ALERTS
+# ─────────────────────────────────────────────
+
+if page == "🚨 Qualitative Alerts":
+    st.markdown("""
+    <div class="mcis-header">
+        <p class="mcis-title">🚨 Qualitative Alert System</p>
+        <p class="mcis-subtitle">News | Insider Trading | SEC Filings — monitoring Tier 1 holdings for thesis breakers</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Build the default monitoring list: Tier 1 from last scan + watchlist
+    tier1 = sorted({r["ticker"] for r in st.session_state.scan_results if r.get("layer") == "LONG_TERM"})
+    wl    = sorted({r["ticker"] for r in st.session_state.watchlist})
+    universe = sorted(set(tier1) | set(wl))
+
+    st.markdown(f'<div class="info-box"><b>Monitoring universe:</b> {len(tier1)} Tier 1 companies from your last scan '
+                f'+ {len(wl)} watchlist companies. Each ticker uses ~3 API calls — keep runs under ~40 tickers '
+                f'to stay inside FMP free-tier limits.</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        default_sel = universe[:15] if universe else []
+        selected = st.multiselect("Tickers to monitor", options=universe, default=default_sel)
+        manual = st.text_input("Add extra tickers (comma separated)", placeholder="e.g. NVDA, ASML, LLY")
+    with c2:
+        news_days   = st.selectbox("News lookback", [7, 14, 30, 60], index=2)
+        filing_days = st.selectbox("SEC filings lookback", [30, 60, 90], index=1)
+
+    scan_list = list(dict.fromkeys(selected + [t.strip().upper() for t in manual.split(",") if t.strip()]))
+
+    if st.button("🚨 Run Alert Scan") and scan_list:
+        prog = st.progress(0, text="Starting alert scan...")
+        results = {}
+        for i, tk in enumerate(scan_list):
+            prog.progress((i + 1) / len(scan_list), text=f"Scanning {tk} ({i+1}/{len(scan_list)})...")
+            results.update(run_alert_scan([tk], news_days=news_days, filing_days=filing_days))
+        prog.empty()
+        st.session_state["alert_results"] = results
+        st.session_state["alert_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    results = st.session_state.get("alert_results", {})
+    if results:
+        st.caption(f"Last alert scan: {st.session_state.get('alert_time','')}")
+        n_crit = sum(1 for r in results.values() for a in r["all"] if a["sev"] == "CRITICAL")
+        n_warn = sum(1 for r in results.values() for a in r["all"] if a["sev"] == "WARNING")
+        n_pos  = sum(1 for r in results.values() for a in r["all"] if a["sev"] == "POSITIVE")
+        n_info = sum(1 for r in results.values() for a in r["all"] if a["sev"] == "INFO")
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.markdown(f'<div class="metric-card" style="border-left-color:#b71c1c"><div class="metric-value" style="color:#b71c1c">{n_crit}</div><div class="metric-label">🔴 Critical — act today</div></div>', unsafe_allow_html=True)
+        k2.markdown(f'<div class="metric-card tier3-card"><div class="metric-value" style="color:#e65100">{n_warn}</div><div class="metric-label">🟠 Warnings — investigate</div></div>', unsafe_allow_html=True)
+        k3.markdown(f'<div class="metric-card tier1-card"><div class="metric-value" style="color:#1b5e20">{n_pos}</div><div class="metric-label">🟢 Positive signals</div></div>', unsafe_allow_html=True)
+        k4.markdown(f'<div class="metric-card"><div class="metric-value">{n_info}</div><div class="metric-label">🔵 Informational</div></div>', unsafe_allow_html=True)
+
+        # Critical feed first — across all tickers
+        crit_feed = [(tk, a) for tk, r in results.items() for a in r["all"] if a["sev"] == "CRITICAL"]
+        if crit_feed:
+            st.markdown('<div class="section-header">🔴 CRITICAL ALERTS — Investment Committee review required</div>', unsafe_allow_html=True)
+            for tk, a in crit_feed:
+                link = f" — [source]({a['link']})" if a["link"] else ""
+                st.error(f"**{tk}** | {a['src']} | {a['date']} — {a['text']}{link}")
+
+        st.markdown('<div class="section-header">📡 Company-by-company feed</div>', unsafe_allow_html=True)
+        order = sorted(results.keys(),
+                       key=lambda t: (-sum(1 for a in results[t]["all"] if a["sev"] == "CRITICAL"),
+                                      -sum(1 for a in results[t]["all"] if a["sev"] == "WARNING")))
+        for tk in order:
+            r = results[tk]
+            nc = sum(1 for a in r["all"] if a["sev"] == "CRITICAL")
+            nw = sum(1 for a in r["all"] if a["sev"] == "WARNING")
+            badge = "🔴" if nc else ("🟠" if nw else "🟢")
+            ins = r["insider"]
+            with st.expander(f"{badge} {tk} — {nc} critical, {nw} warnings | insiders: "
+                             f"{ins.get('n_buys',0)} buys / {ins.get('n_sells',0)} sells"):
+                if ins.get("n_sells") or ins.get("n_buys"):
+                    st.caption(f"Insider 90-day flow: bought ${ins.get('buy_val',0)/1e6:.1f}M | "
+                               f"sold ${ins.get('sell_val',0)/1e6:.1f}M")
+                if not r["all"]:
+                    st.success("✓ Quiet — no qualitative alerts in the lookback window. Thesis undisturbed.")
+                for a in sorted(r["all"], key=lambda x: {"CRITICAL":0,"WARNING":1,"POSITIVE":2,"INFO":3}[x["sev"]]):
+                    link = f" — [source]({a['link']})" if a["link"] else ""
+                    line = f"**{a['src']}** {a['date']} — {a['text']}" + (f" _({a['why']})_" if a["why"] else "") + link
+                    if a["sev"] == "CRITICAL":  st.error(line)
+                    elif a["sev"] == "WARNING": st.warning(line)
+                    elif a["sev"] == "POSITIVE":st.success(line)
+                    else:                       st.info(line)
+
+        st.markdown("""
+        <div class="warning-box"><b>MCIS Rule — Section 16 triggers:</b> any 🔴 CRITICAL alert on a held position
+        requires an Investment Committee thesis review within 48 hours. A cluster of insider selling alone is not a
+        thesis breaker — but combined with a guidance cut or accounting alert, it is.</div>
+        """, unsafe_allow_html=True)
+    elif not universe:
+        st.markdown('<div class="info-box">No Tier 1 or watchlist companies found yet — run the Scanner first, '
+                    'or add tickers manually above.</div>', unsafe_allow_html=True)
