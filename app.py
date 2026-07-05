@@ -145,7 +145,7 @@ st.markdown("""
 try:
     API_KEY = st.secrets["FMP_API_KEY"]
 except Exception:
-    API_KEY = API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n"  
+    API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n" 
 BASE    = "https://financialmodelingprep.com/api/v3"  # ← FIXED: Changed from /stable to /api/v3
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
