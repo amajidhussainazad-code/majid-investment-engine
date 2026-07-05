@@ -145,8 +145,8 @@ st.markdown("""
 try:
     API_KEY = st.secrets["FMP_API_KEY"]
 except Exception:
-    API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n"
-BASE    = "https://financialmodelingprep.com/api/v3"
+    API_KEY = "fQUnMh24O1zf1FQ2kO7ldTELkf0qwRGz"
+BASE    = "https://financialmodelingprep.com/stable"
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
            "pork","adult entertainment","weapons of mass"]
@@ -170,32 +170,12 @@ CURATED = [
 
 @st.cache_data(ttl=3600)
 def fmp_get(endpoint, params):
-    """Fetch data from FMP API with detailed error logging."""
     try:
         p = dict(params)
         p["apikey"] = API_KEY
-        url = f"{BASE}/{endpoint}"
-        r = requests.get(url, params=p, timeout=15)
-        
-        # Check HTTP status
-        if r.status_code != 200:
-            print(f"⚠️  FMP API HTTP {r.status_code} | {endpoint} | {r.text[:100]}")
-            return []
-        
-        data = r.json()
-        
-        # Check for API error response
-        if isinstance(data, dict) and "error" in data:
-            print(f"⚠️  FMP API ERROR | {endpoint} | {data.get('error')}")
-            return []
-        
-        return data
-        
-    except requests.exceptions.Timeout:
-        print(f"⚠️  FMP API TIMEOUT | {endpoint}")
-        return []
-    except Exception as e:
-        print(f"⚠️  FMP API EXCEPTION | {endpoint} | {str(e)[:100]}")
+        r = requests.get(f"{BASE}/{endpoint}", params=p, timeout=15)
+        return r.json()
+    except:
         return []
 
 def fetch_company(ticker):
@@ -553,8 +533,8 @@ def fmt_mktcap(v):
 def analyze_etf_prices(etf_ticker):
     """Fetch and analyze 5-year ETF price history with caching"""
     try:
-        # Fetch historical prices
-        hist = fmp_get("historical-price-full", {"symbol": etf_ticker})
+        # Try historical prices with caching
+        hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
         
         if isinstance(hist, dict) and "historical" in hist:
             prices = hist.get("historical", [])
@@ -742,20 +722,20 @@ def results_to_df(results):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_prices_yahoo(ticker, days=1825):
-    """Fetch 5 years of historical daily close prices from FMP."""
+    """Fetch 5 years of historical daily close prices from FMP (now unlocked with premium)."""
     try:
-        # Fetch historical prices - FMP returns all available history
-        raw = fmp_get("historical-price-full", {"symbol": ticker})
+        raw = fmp_get("historical-price-full", {"symbol": ticker, "timeseries": days})
         
-        # Check what we got back
+        # Debug: check what we got back
         if isinstance(raw, dict):
             if "historical" in raw:
                 prices = raw["historical"]
                 if prices and len(prices) > 0:
                     return sorted(prices, key=lambda x: x["date"])
             elif "error" in raw:
-                return None
+                return None  # Silent fail, will show message to user
             else:
+                # Got dict but no historical or error key
                 return None
         
         if isinstance(raw, list) and len(raw) > 0:
@@ -1283,12 +1263,55 @@ if page == "🏠 Dashboard":
                 except:
                     r["signal"] = "⚠️ ANALYZE"
             
-            df_t1 = results_to_df(sorted(t1, key=lambda x: x["score"], reverse=True)[:15])
-            df_t1["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in sorted(t1, key=lambda x: x["score"], reverse=True)[:15]]
+            # PHASE 1: PILL BUTTON FILTER
+            # Initialize session state for signal filter
+            if 'selected_signal_tier1' not in st.session_state:
+                st.session_state.selected_signal_tier1 = 'All'
             
-            st.dataframe(df_t1[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
-                        use_container_width=True, hide_index=True)
-            st.caption("📊 Top 15 Tier 1 companies with investment signals. Load in Valuation Engine for detailed analysis.")
+            # Create pill button filter
+            st.markdown("#### 🔍 Filter by Signal")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if st.button('All', key='btn_all_tier1', use_container_width=True):
+                    st.session_state.selected_signal_tier1 = 'All'
+            
+            with col2:
+                if st.button('🟢 Buy', key='btn_buy_tier1', use_container_width=True):
+                    st.session_state.selected_signal_tier1 = '🟢 BUY'
+            
+            with col3:
+                if st.button('🟡 Wait', key='btn_wait_tier1', use_container_width=True):
+                    st.session_state.selected_signal_tier1 = '🟡 WAIT'
+            
+            with col4:
+                if st.button('🔴 Avoid', key='btn_avoid_tier1', use_container_width=True):
+                    st.session_state.selected_signal_tier1 = '🔴 AVOID'
+            
+            st.markdown("---")
+            
+            # Get sorted list
+            sorted_t1 = sorted(t1, key=lambda x: x["score"], reverse=True)[:15]
+            
+            # Filter based on selected signal
+            if st.session_state.selected_signal_tier1 == 'All':
+                filtered_t1 = sorted_t1
+                st.info(f"📊 Showing: {len(filtered_t1)} Tier 1 companies")
+            else:
+                filtered_t1 = [r for r in sorted_t1 if r.get("signal") == st.session_state.selected_signal_tier1]
+                st.info(f"📊 Showing: {len(filtered_t1)} companies with signal '{st.session_state.selected_signal_tier1}'")
+            
+            # Display filtered dataframe
+            if filtered_t1:
+                df_t1 = results_to_df(filtered_t1)
+                df_t1["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in filtered_t1]
+                
+                st.dataframe(df_t1[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
+                            use_container_width=True, hide_index=True)
+                st.caption("📊 Tier 1 companies with investment signals. Load in Valuation Engine for detailed analysis.")
+            else:
+                st.warning(f"No Tier 1 companies found with signal '{st.session_state.selected_signal_tier1}'")
+            
         else:
             st.info("No Tier 1 results yet. Run the scanner first.")
 
@@ -2394,6 +2417,102 @@ if page == "📄 Company Dossier":
         risks = st.text_area("What could change our investment decision? List the 5 biggest risks.",
                              placeholder="1. AI demand slowdown\n2. Competitive threat from AMD\n3. Geopolitical export restrictions\n4. Valuation compression\n5. Supply chain disruption",
                              height=100, key="risks")
+
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # PHASE 2: FINANCIAL STATEMENTS — 4-Year History
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        
+        st.markdown("---")
+        st.markdown('<div class="section-header">📊 Financial Statements — 4-Year History</div>', unsafe_allow_html=True)
+        
+        # Get financial data from vd (valuation data)
+        try:
+            # Extract available metrics from valuation data
+            roic = v.get("roic", 0)
+            gross_margin = v.get("gm", 0)
+            fcf = v.get("fcf0", 0)
+            rev_cagr = v.get("rev_cagr", 0)
+            debt_equity = v.get("debt_equity", 0)
+            pe = m.get("pe", 0)
+            ev_ebitda = m.get("ev_ebitda", 0)
+            peg_val = peg or 0
+            
+            # Display Quality Metrics
+            st.subheader("Quality Metrics (Latest Year)")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("ROIC %", f"{roic:.1f}%", "↗ Quality")
+            with col2:
+                st.metric("Gross Margin %", f"{gross_margin:.1f}%", "↗ Improving")
+            with col3:
+                st.metric("Revenue CAGR %", f"{rev_cagr*100:.1f}%", "↗ Growing")
+            with col4:
+                st.metric("Debt/Equity", f"{debt_equity:.2f}", "↓ Safe")
+            
+            st.markdown("---")
+            
+            # Display Valuation Metrics
+            st.subheader("Valuation Metrics (Current)")
+            
+            val_col1, val_col2, val_col3 = st.columns(3)
+            with val_col1:
+                status = "Fair" if 28 <= pe <= 45 else "High" if pe > 45 else "Low"
+                st.metric("P/E Ratio", f"{pe:.1f}x", f"Status: {status}")
+            with val_col2:
+                status_ev = "Fair" if 15 <= ev_ebitda <= 22 else "High" if ev_ebitda > 22 else "Low"
+                st.metric("EV/EBITDA", f"{ev_ebitda:.1f}x", f"Status: {status_ev}")
+            with val_col3:
+                peg_status = "✅ Fair" if peg_val < 1.5 else "⚠️ Expensive"
+                st.metric("PEG Ratio", f"{peg_val:.2f}", peg_status)
+            
+            st.markdown("---")
+            
+            # Key Investment Insights
+            st.subheader("Key Insights from Financials")
+            
+            insights = []
+            
+            if roic > 25:
+                insights.append("✅ **Fortress Moat**: ROIC > 25% indicates strong competitive advantage")
+            elif roic > 15:
+                insights.append("✅ **Good Moat**: ROIC > 15% shows sustainable competitive position")
+            else:
+                insights.append("⚠️ **Monitor Moat**: ROIC < 15%, watch competitive dynamics")
+            
+            if gross_margin > 50:
+                insights.append("✅ **Strong Pricing Power**: Gross margin > 50% shows pricing strength")
+            else:
+                insights.append("⚠️ **Margin Pressure**: Gross margin < 50%, watch for cost inflation")
+            
+            if rev_cagr > 0.15:
+                insights.append("✅ **High Growth**: Revenue CAGR > 15% indicates strong market demand")
+            elif rev_cagr > 0.05:
+                insights.append("✅ **Solid Growth**: Revenue CAGR 5-15% is healthy for mature companies")
+            else:
+                insights.append("⚠️ **Slow Growth**: Revenue CAGR < 5%, may face headwinds")
+            
+            if debt_equity < 0.5:
+                insights.append("✅ **Strong Balance Sheet**: Debt/Equity < 0.5 provides financial flexibility")
+            elif debt_equity < 1.0:
+                insights.append("✅ **Manageable Debt**: Debt/Equity < 1.0 is reasonable for growth")
+            else:
+                insights.append("⚠️ **High Leverage**: Debt/Equity > 1.0, monitor debt levels")
+            
+            if peg_val < 1.5:
+                insights.append("✅ **Fair Valuation**: PEG < 1.5 suggests reasonable price for growth")
+            else:
+                insights.append("⚠️ **Premium Valuation**: PEG > 1.5, may be priced for high growth")
+            
+            for insight in insights:
+                st.write(insight)
+            
+            st.info("💡 **Tip**: All metrics should improve over time. Deteriorating trends = warning sign.")
+            
+        except Exception as e:
+            st.warning(f"Could not display financial metrics: {str(e)[:100]}")
+        
+        st.markdown("---")
 
         # Generate dossier
         if st.button("📄 Generate Dossier PDF", key="gen_dos"):
