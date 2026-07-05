@@ -2419,98 +2419,183 @@ if page == "📄 Company Dossier":
                              height=100, key="risks")
 
         # ═══════════════════════════════════════════════════════════════════════════════════
-        # PHASE 2: FINANCIAL STATEMENTS — 4-Year History
+        # PHASE 2: REAL FINANCIAL STATEMENTS — 5-Year History
         # ═══════════════════════════════════════════════════════════════════════════════════
         
         st.markdown("---")
-        st.markdown('<div class="section-header">📊 Financial Statements — 4-Year History</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">📊 Financial Statements — 5-Year History</div>', unsafe_allow_html=True)
         
-        # Get financial data from vd (valuation data)
+        # Fetch real financial data from FMP API
         try:
-            # Extract available metrics from valuation data
-            roic = v.get("roic", 0)
-            gross_margin = v.get("gm", 0)
-            fcf = v.get("fcf0", 0)
-            rev_cagr = v.get("rev_cagr", 0)
-            debt_equity = v.get("debt_equity", 0)
-            pe = m.get("pe", 0)
-            ev_ebitda = m.get("ev_ebitda", 0)
-            peg_val = peg or 0
+            # Fetch Income Statement
+            income_stmt = fmp_get("income-statement", {"symbol": dos_ticker, "limit": 5})
             
-            # Display Quality Metrics
-            st.subheader("Quality Metrics (Latest Year)")
+            # Fetch Cash Flow Statement
+            cashflow_stmt = fmp_get("cash-flow-statement", {"symbol": dos_ticker, "limit": 5})
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("ROIC %", f"{roic:.1f}%", "↗ Quality")
-            with col2:
-                st.metric("Gross Margin %", f"{gross_margin:.1f}%", "↗ Improving")
-            with col3:
-                st.metric("Revenue CAGR %", f"{rev_cagr*100:.1f}%", "↗ Growing")
-            with col4:
-                st.metric("Debt/Equity", f"{debt_equity:.2f}", "↓ Safe")
+            # Fetch Balance Sheet
+            balance_sheet = fmp_get("balance-sheet-statement", {"symbol": dos_ticker, "limit": 5})
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # TABLE 1: INCOME STATEMENT (5 YEARS)
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            if income_stmt and isinstance(income_stmt, list) and len(income_stmt) > 0:
+                st.subheader("📈 Income Statement (5 Years)")
+                
+                # Build income statement dataframe
+                income_data = []
+                for stmt in sorted(income_stmt, key=lambda x: x.get('date', ''))[-5:]:  # Last 5 years
+                    year = stmt.get('date', '').split('-')[0]
+                    revenue = stmt.get('revenue', 0)
+                    revenue_growth = stmt.get('revenueGrowth', 0)
+                    gross_profit = stmt.get('grossProfit', 0)
+                    gross_margin = (gross_profit / revenue * 100) if revenue > 0 else 0
+                    operating_income = stmt.get('operatingIncome', 0)
+                    operating_margin = (operating_income / revenue * 100) if revenue > 0 else 0
+                    net_income = stmt.get('netIncome', 0)
+                    net_margin = (net_income / revenue * 100) if revenue > 0 else 0
+                    eps = stmt.get('eps', 0)
+                    
+                    income_data.append({
+                        'Year': year,
+                        'Revenue ($B)': f"${revenue/1e9:.1f}B" if revenue else "—",
+                        'Revenue Growth %': f"{revenue_growth*100:.1f}%" if revenue_growth else "—",
+                        'Gross Profit ($B)': f"${gross_profit/1e9:.1f}B" if gross_profit else "—",
+                        'Gross Margin %': f"{gross_margin:.1f}%" if gross_margin > 0 else "—",
+                        'Operating Income ($B)': f"${operating_income/1e9:.1f}B" if operating_income else "—",
+                        'Operating Margin %': f"{operating_margin:.1f}%" if operating_margin > 0 else "—",
+                        'Net Income ($B)': f"${net_income/1e9:.1f}B" if net_income else "—",
+                        'Net Margin %': f"{net_margin:.1f}%" if net_margin > 0 else "—",
+                        'EPS': f"${eps:.2f}" if eps else "—"
+                    })
+                
+                df_income = pd.DataFrame(income_data)
+                st.dataframe(df_income, use_container_width=True, hide_index=True)
+                st.caption("💡 Look for: Growing revenue, stable margins, improving earnings")
+            else:
+                st.warning("Income statement data not available")
             
             st.markdown("---")
             
-            # Display Valuation Metrics
-            st.subheader("Valuation Metrics (Current)")
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # TABLE 2: CASH FLOW STATEMENT (5 YEARS)
+            # ═══════════════════════════════════════════════════════════════════════════════
             
-            val_col1, val_col2, val_col3 = st.columns(3)
-            with val_col1:
-                status = "Fair" if 28 <= pe <= 45 else "High" if pe > 45 else "Low"
-                st.metric("P/E Ratio", f"{pe:.1f}x", f"Status: {status}")
-            with val_col2:
-                status_ev = "Fair" if 15 <= ev_ebitda <= 22 else "High" if ev_ebitda > 22 else "Low"
-                st.metric("EV/EBITDA", f"{ev_ebitda:.1f}x", f"Status: {status_ev}")
-            with val_col3:
-                peg_status = "✅ Fair" if peg_val < 1.5 else "⚠️ Expensive"
-                st.metric("PEG Ratio", f"{peg_val:.2f}", peg_status)
+            if cashflow_stmt and isinstance(cashflow_stmt, list) and len(cashflow_stmt) > 0:
+                st.subheader("💰 Cash Flow Statement (5 Years)")
+                
+                # Build cash flow dataframe
+                cashflow_data = []
+                for stmt in sorted(cashflow_stmt, key=lambda x: x.get('date', ''))[-5:]:
+                    year = stmt.get('date', '').split('-')[0]
+                    operating_cf = stmt.get('operatingCashFlow', 0)
+                    capex = stmt.get('capitalExpenditure', 0)
+                    free_cf = stmt.get('freeCashFlow', 0)
+                    revenue = stmt.get('operatingCashFlow', 0)  # Use OCF as proxy
+                    fcf_margin = (free_cf / revenue * 100) if revenue > 0 else 0
+                    
+                    cashflow_data.append({
+                        'Year': year,
+                        'Operating Cash Flow ($B)': f"${operating_cf/1e9:.1f}B" if operating_cf else "—",
+                        'Capital Expenditure ($B)': f"${abs(capex)/1e9:.1f}B" if capex else "—",
+                        'Free Cash Flow ($B)': f"${free_cf/1e9:.1f}B" if free_cf else "—",
+                        'FCF Margin %': f"{fcf_margin:.1f}%" if fcf_margin > 0 else "—"
+                    })
+                
+                df_cashflow = pd.DataFrame(cashflow_data)
+                st.dataframe(df_cashflow, use_container_width=True, hide_index=True)
+                st.caption("💡 Look for: Growing free cash flow, low capex relative to revenue")
+            else:
+                st.warning("Cash flow statement data not available")
             
             st.markdown("---")
             
-            # Key Investment Insights
-            st.subheader("Key Insights from Financials")
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # TABLE 3: BALANCE SHEET & CAPITAL STRUCTURE (5 YEARS)
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            if balance_sheet and isinstance(balance_sheet, list) and len(balance_sheet) > 0:
+                st.subheader("⚖️ Balance Sheet & Capital Structure (5 Years)")
+                
+                # Build balance sheet dataframe
+                balance_data = []
+                for stmt in sorted(balance_sheet, key=lambda x: x.get('date', ''))[-5:]:
+                    year = stmt.get('date', '').split('-')[0]
+                    cash = stmt.get('cashAndCashEquivalents', 0)
+                    total_debt = stmt.get('totalDebt', 0)
+                    net_debt = total_debt - cash
+                    equity = stmt.get('totalStockholdersEquity', 0)
+                    debt_equity = (total_debt / equity) if equity > 0 else 0
+                    
+                    balance_data.append({
+                        'Year': year,
+                        'Cash ($B)': f"${cash/1e9:.1f}B" if cash else "—",
+                        'Total Debt ($B)': f"${total_debt/1e9:.1f}B" if total_debt else "—",
+                        'Net Debt ($B)': f"${net_debt/1e9:.1f}B" if net_debt else "—",
+                        'Shareholders Equity ($B)': f"${equity/1e9:.1f}B" if equity else "—",
+                        'Debt/Equity Ratio': f"{debt_equity:.2f}" if debt_equity >= 0 else "—"
+                    })
+                
+                df_balance = pd.DataFrame(balance_data)
+                st.dataframe(df_balance, use_container_width=True, hide_index=True)
+                st.caption("💡 Look for: Strong cash position, low debt, improving equity")
+            else:
+                st.warning("Balance sheet data not available")
+            
+            st.markdown("---")
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # KEY FINANCIAL INSIGHTS
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            st.subheader("🎯 Key Financial Insights")
             
             insights = []
             
-            if roic > 25:
-                insights.append("✅ **Fortress Moat**: ROIC > 25% indicates strong competitive advantage")
-            elif roic > 15:
-                insights.append("✅ **Good Moat**: ROIC > 15% shows sustainable competitive position")
-            else:
-                insights.append("⚠️ **Monitor Moat**: ROIC < 15%, watch competitive dynamics")
+            # Analyze income statement trends
+            if income_stmt and len(income_stmt) >= 2:
+                latest_revenue = income_stmt[0].get('revenue', 0)
+                prev_revenue = income_stmt[1].get('revenue', 0) if len(income_stmt) > 1 else latest_revenue
+                rev_trend = ((latest_revenue - prev_revenue) / prev_revenue * 100) if prev_revenue > 0 else 0
+                
+                if rev_trend > 10:
+                    insights.append("✅ **Strong Revenue Growth**: >10% YoY indicates healthy demand")
+                elif rev_trend > 0:
+                    insights.append("✅ **Positive Revenue Growth**: Growing steadily")
+                else:
+                    insights.append("⚠️ **Declining Revenue**: Watch for headwinds")
             
-            if gross_margin > 50:
-                insights.append("✅ **Strong Pricing Power**: Gross margin > 50% shows pricing strength")
-            else:
-                insights.append("⚠️ **Margin Pressure**: Gross margin < 50%, watch for cost inflation")
+            # Analyze cash flow
+            if cashflow_stmt and len(cashflow_stmt) >= 1:
+                latest_fcf = cashflow_stmt[0].get('freeCashFlow', 0)
+                if latest_fcf > 0:
+                    insights.append("✅ **Positive Free Cash Flow**: Company generates real cash")
+                else:
+                    insights.append("⚠️ **Negative/Low FCF**: Watch cash burn rate")
             
-            if rev_cagr > 0.15:
-                insights.append("✅ **High Growth**: Revenue CAGR > 15% indicates strong market demand")
-            elif rev_cagr > 0.05:
-                insights.append("✅ **Solid Growth**: Revenue CAGR 5-15% is healthy for mature companies")
-            else:
-                insights.append("⚠️ **Slow Growth**: Revenue CAGR < 5%, may face headwinds")
-            
-            if debt_equity < 0.5:
-                insights.append("✅ **Strong Balance Sheet**: Debt/Equity < 0.5 provides financial flexibility")
-            elif debt_equity < 1.0:
-                insights.append("✅ **Manageable Debt**: Debt/Equity < 1.0 is reasonable for growth")
-            else:
-                insights.append("⚠️ **High Leverage**: Debt/Equity > 1.0, monitor debt levels")
-            
-            if peg_val < 1.5:
-                insights.append("✅ **Fair Valuation**: PEG < 1.5 suggests reasonable price for growth")
-            else:
-                insights.append("⚠️ **Premium Valuation**: PEG > 1.5, may be priced for high growth")
+            # Analyze balance sheet
+            if balance_sheet and len(balance_sheet) >= 1:
+                latest_cash = balance_sheet[0].get('cashAndCashEquivalents', 0)
+                latest_debt = balance_sheet[0].get('totalDebt', 0)
+                net_debt = latest_debt - latest_cash
+                
+                if net_debt < 0:
+                    insights.append("✅ **Net Cash Position**: Company has more cash than debt")
+                elif net_debt < latest_cash:
+                    insights.append("✅ **Manageable Debt**: Debt < Cash position")
+                else:
+                    insights.append("⚠️ **High Leverage**: Debt exceeds cash, monitor closely")
             
             for insight in insights:
                 st.write(insight)
             
-            st.info("💡 **Tip**: All metrics should improve over time. Deteriorating trends = warning sign.")
+            if not insights:
+                st.info("💡 Load complete financial statements above for detailed analysis")
             
         except Exception as e:
-            st.warning(f"Could not display financial metrics: {str(e)[:100]}")
+            st.warning(f"Could not fetch financial statements: {str(e)[:100]}")
+            st.info("💡 This is normal if the API is rate-limited. Try again in a moment.")
         
         st.markdown("---")
 
