@@ -145,8 +145,8 @@ st.markdown("""
 try:
     API_KEY = st.secrets["FMP_API_KEY"]
 except Exception:
-    API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n" 
-BASE    = "https://financialmodelingprep.com/api/v3"  # ← FIXED: Changed from /stable to /api/v3
+    API_KEY = "M0qtxFxr2LpUd31enfbDz2egSvXNI61n"
+BASE    = "https://financialmodelingprep.com/api/v3"
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
            "pork","adult entertainment","weapons of mass"]
@@ -170,31 +170,32 @@ CURATED = [
 
 @st.cache_data(ttl=3600)
 def fmp_get(endpoint, params):
-    """Fetch data from FMP API with error logging for debugging."""
+    """Fetch data from FMP API with detailed error logging."""
     try:
         p = dict(params)
         p["apikey"] = API_KEY
         url = f"{BASE}/{endpoint}"
         r = requests.get(url, params=p, timeout=15)
         
-        # Check for HTTP errors
+        # Check HTTP status
         if r.status_code != 200:
-            print(f"⚠️  FMP API HTTP ERROR {r.status_code}")
-            print(f"   Endpoint: {endpoint}")
-            print(f"   URL: {url}")
-            print(f"   Response: {r.text[:300]}")
+            print(f"⚠️  FMP API HTTP {r.status_code} | {endpoint} | {r.text[:100]}")
             return []
         
         data = r.json()
         
-        # Check if response contains error message
+        # Check for API error response
         if isinstance(data, dict) and "error" in data:
-            print(f"⚠️  FMP API ERROR MESSAGE: {data.get('error')}")
+            print(f"⚠️  FMP API ERROR | {endpoint} | {data.get('error')}")
             return []
         
         return data
+        
+    except requests.exceptions.Timeout:
+        print(f"⚠️  FMP API TIMEOUT | {endpoint}")
+        return []
     except Exception as e:
-        print(f"⚠️  FMP API EXCEPTION: {str(e)}")
+        print(f"⚠️  FMP API EXCEPTION | {endpoint} | {str(e)[:100]}")
         return []
 
 def fetch_company(ticker):
@@ -552,8 +553,7 @@ def fmt_mktcap(v):
 def analyze_etf_prices(etf_ticker):
     """Fetch and analyze 5-year ETF price history with caching"""
     try:
-        # Try historical prices with caching
-        # FIXED: Removed incorrect 'serietype' parameter
+        # Fetch historical prices
         hist = fmp_get("historical-price-full", {"symbol": etf_ticker})
         
         if isinstance(hist, dict) and "historical" in hist:
@@ -742,22 +742,20 @@ def results_to_df(results):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_prices_yahoo(ticker, days=1825):
-    """Fetch 5 years of historical daily close prices from FMP (now unlocked with premium)."""
+    """Fetch 5 years of historical daily close prices from FMP."""
     try:
-        # FIXED: Removed incorrect 'timeseries' parameter
-        # FMP returns all available history by default
+        # Fetch historical prices - FMP returns all available history
         raw = fmp_get("historical-price-full", {"symbol": ticker})
         
-        # Debug: check what we got back
+        # Check what we got back
         if isinstance(raw, dict):
             if "historical" in raw:
                 prices = raw["historical"]
                 if prices and len(prices) > 0:
                     return sorted(prices, key=lambda x: x["date"])
             elif "error" in raw:
-                return None  # Silent fail, will show message to user
+                return None
             else:
-                # Got dict but no historical or error key
                 return None
         
         if isinstance(raw, list) and len(raw) > 0:
