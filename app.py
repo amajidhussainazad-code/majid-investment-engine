@@ -2445,10 +2445,23 @@ if page == "📄 Company Dossier":
                 
                 # Build income statement dataframe
                 income_data = []
-                for stmt in sorted(income_stmt, key=lambda x: x.get('date', ''))[-5:]:  # Last 5 years
+                sorted_stmts = sorted(income_stmt, key=lambda x: x.get('date', ''))[-5:]  # Last 5 years
+                
+                for idx, stmt in enumerate(sorted_stmts):
                     year = stmt.get('date', '').split('-')[0]
                     revenue = stmt.get('revenue', 0)
-                    revenue_growth = stmt.get('revenueGrowth', 0)
+                    
+                    # Calculate revenue growth from previous year
+                    if idx == 0:
+                        revenue_growth = "—"
+                    else:
+                        prev_revenue = sorted_stmts[idx-1].get('revenue', 0)
+                        if prev_revenue > 0:
+                            rev_growth_pct = ((revenue - prev_revenue) / prev_revenue) * 100
+                            revenue_growth = f"{rev_growth_pct:.1f}%"
+                        else:
+                            revenue_growth = "—"
+                    
                     gross_profit = stmt.get('grossProfit', 0)
                     gross_margin = (gross_profit / revenue * 100) if revenue > 0 else 0
                     operating_income = stmt.get('operatingIncome', 0)
@@ -2460,7 +2473,7 @@ if page == "📄 Company Dossier":
                     income_data.append({
                         'Year': year,
                         'Revenue ($B)': f"${revenue/1e9:.1f}B" if revenue else "—",
-                        'Revenue Growth %': f"{revenue_growth*100:.1f}%" if revenue_growth else "—",
+                        'Revenue Growth %': revenue_growth,
                         'Gross Profit ($B)': f"${gross_profit/1e9:.1f}B" if gross_profit else "—",
                         'Gross Margin %': f"{gross_margin:.1f}%" if gross_margin > 0 else "—",
                         'Operating Income ($B)': f"${operating_income/1e9:.1f}B" if operating_income else "—",
