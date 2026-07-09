@@ -929,8 +929,7 @@ def p3_etf_scan(etf_ticker):
         # Performance check for early bird status
         perf_1y = 0
         try:
-            hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
-            prices = hist.get('historical', []) if isinstance(hist, dict) else []
+            prices = fetch_price_history(etf_ticker, days=300)
             if len(prices) >= 200:
                 perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
         except: pass
@@ -989,8 +988,7 @@ def p3_etf_scan(etf_ticker):
     # 6. Performance (20 pts) — 1yr return
     perf_1y = 0
     try:
-        hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
-        prices = hist.get('historical', []) if isinstance(hist, dict) else []
+        prices = fetch_price_history(etf_ticker, days=300)
         if len(prices) >= 200:
             perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
     except: pass
@@ -1038,38 +1036,57 @@ def p3_etf_scan(etf_ticker):
 
     return r
 
-def analyze_etf_prices(etf_ticker):
-    """Fetch and analyze 5-year ETF price history with caching"""
+def fetch_price_history(ticker, days=1300):
+    """Universal price history fetcher — works with /stable API (new) and legacy.
+    Returns list of {'date','close'} newest-first, or []."""
+    # 1) NEW stable endpoint (light = date+price)
     try:
-        # Try historical prices with caching
-        hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
-        
+        data = fmp_get("historical-price-eod/light", {"symbol": ticker})
+        if isinstance(data, list) and len(data) > 0 and data[0].get("price") is not None:
+            out = [{"date": d.get("date",""), "close": float(d.get("price",0) or 0)} for d in data]
+            out = [o for o in out if o["close"] > 0]
+            out.sort(key=lambda x: x["date"], reverse=True)  # newest first
+            return out[:days]
+    except: pass
+    # 2) stable full (has 'close')
+    try:
+        data = fmp_get("historical-price-eod/full", {"symbol": ticker})
+        if isinstance(data, list) and len(data) > 0 and data[0].get("close") is not None:
+            out = [{"date": d.get("date",""), "close": float(d.get("close",0) or 0)} for d in data]
+            out = [o for o in out if o["close"] > 0]
+            out.sort(key=lambda x: x["date"], reverse=True)
+            return out[:days]
+    except: pass
+    # 3) legacy fallback
+    try:
+        hist = fmp_get("historical-price-full", {"symbol": ticker, "serietype": "line"})
         if isinstance(hist, dict) and "historical" in hist:
-            prices = hist.get("historical", [])
-            if prices and len(prices) > 0:
-                # Get current and historical stats
-                current = float(prices[0].get("close", 0)) or float(prices[0].get("adjClose", 0)) or 0
-                
-                # Get 5-year data (1250 trading days ≈ 5 years)
-                five_year = prices[:min(1250, len(prices))]
-                closes = [float(p.get("close", 0)) or float(p.get("adjClose", 0)) for p in five_year if (p.get("close") or p.get("adjClose"))]
-                
-                if closes and current > 0:
-                    high_5y = max(closes)
-                    low_5y = min(closes)
-                    buy_target = low_5y * 0.95
-                    
-                    return {
-                        "current": current,
-                        "high": high_5y,
-                        "low": low_5y,
-                        "target": buy_target,
-                        "status": "✅ Data"
-                    }
-    except Exception as e:
-        pass
-    
-    # Fallback: Get current quote and show note
+            out = [{"date": d.get("date",""), "close": float(d.get("close",0) or d.get("adjClose",0) or 0)}
+                   for d in hist["historical"]]
+            out = [o for o in out if o["close"] > 0]
+            out.sort(key=lambda x: x["date"], reverse=True)
+            return out[:days]
+    except: pass
+    return []
+
+def analyze_etf_prices(etf_ticker):
+    """Fetch and analyze 5-year ETF price history"""
+    prices = fetch_price_history(etf_ticker, days=1300)  # ~5 years
+    if prices:
+        current = prices[0]["close"]
+        closes = [p["close"] for p in prices]
+        if closes and current > 0:
+            high_5y = max(closes)
+            low_5y = min(closes)
+            buy_target = low_5y * 0.95
+            return {
+                "current": current,
+                "high": high_5y,
+                "low": low_5y,
+                "target": buy_target,
+                "status": "✅ Data"
+            }
+    # Fallback: current quote with estimates
     try:
         quote = fmp_get("quote", {"symbol": etf_ticker})
         if quote and isinstance(quote, list) and len(quote) > 0:
@@ -1084,7 +1101,6 @@ def analyze_etf_prices(etf_ticker):
                 }
     except:
         pass
-    
     return None
 
 def calculate_blended_fair_value(r):
@@ -1230,25 +1246,12 @@ def results_to_df(results):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_prices_yahoo(ticker, days=1825):
-    """Fetch 5 years of historical daily close prices from FMP (now unlocked with premium)."""
+    """Fetch 5 years of historical daily close prices (stable API with legacy fallback)."""
     try:
-        raw = fmp_get("historical-price-full", {"symbol": ticker, "timeseries": days})
-        
-        # Debug: check what we got back
-        if isinstance(raw, dict):
-            if "historical" in raw:
-                prices = raw["historical"]
-                if prices and len(prices) > 0:
-                    return sorted(prices, key=lambda x: x["date"])
-            elif "error" in raw:
-                return None  # Silent fail, will show message to user
-            else:
-                # Got dict but no historical or error key
-                return None
-        
-        if isinstance(raw, list) and len(raw) > 0:
-            return raw
-        
+        prices = fetch_price_history(ticker, days=days)
+        if prices:
+            # Chart code expects oldest-first list of dicts with 'date' and 'close'
+            return sorted(prices, key=lambda x: x["date"])
         return []
     except Exception as e:
         return []
@@ -2126,7 +2129,7 @@ elif page == "🔎 Company Lookup":
                     st.info("Chart unavailable")
             else:
                 with st.expander("🔧 Troubleshooting: Why no price history?"):
-                    st.warning(f"⚠️ FMP historical-price-full endpoint not returning data for {ticker_input}")
+                    st.warning(f"⚠️ FMP price history endpoint not returning data for {ticker_input}")
                     st.caption("""
                     **Possible reasons:**
                     - Endpoint not available on your current FMP plan (verify in FMP dashboard)
@@ -2135,7 +2138,7 @@ elif page == "🔎 Company Lookup":
                     
                     **Current price from FMP:** $""" + str(data.get('price', 'N/A')) + """
                     
-                    Check: Go to FMP dashboard → test historical-price-full endpoint manually
+                    Check: Go to FMP dashboard → test historical-price-eod/light endpoint manually
                     """)
                 st.info(f"Current price from FMP: ${data.get('price', 'N/A')}")
 
@@ -2925,6 +2928,34 @@ if page == "📄 Company Dossier":
         risks = st.text_area("What could change our investment decision? List the 5 biggest risks.",
                              placeholder="1. AI demand slowdown\n2. Competitive threat from AMD\n3. Geopolitical export restrictions\n4. Valuation compression\n5. Supply chain disruption",
                              height=100, key="risks")
+
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # 5-YEAR PRICE CHART
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown('<div class="section-header">📉 5-Year Share Price History</div>', unsafe_allow_html=True)
+        try:
+            dos_prices = fetch_historical_prices_yahoo(dos_ticker, days=1825)
+            if dos_prices and len(dos_prices) > 1:
+                dos_current = float(vd.get("quote", {}).get("price", 0) or 0)
+                fig_dos = plot_5year_price_chart_yahoo(dos_prices, dos_ticker, current_price=dos_current or None)
+                if fig_dos:
+                    st.plotly_chart(fig_dos, use_container_width=True)
+                    closes_dos = [p.get("close", 0) for p in dos_prices if p.get("close")]
+                    if closes_dos:
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1: st.metric("5Y High", f"${max(closes_dos):.2f}")
+                        with c2: st.metric("5Y Low", f"${min(closes_dos):.2f}")
+                        with c3: st.metric("Current", f"${closes_dos[-1]:.2f}")
+                        with c4:
+                            off_high = (closes_dos[-1]/max(closes_dos)-1)*100
+                            st.metric("From 5Y High", f"{off_high:+.1f}%")
+                else:
+                    st.info("Chart could not be rendered.")
+            else:
+                st.info("⏳ 5-year price history not available for this ticker (endpoint returned no data).")
+        except Exception as e:
+            st.warning(f"Price chart error: {str(e)[:80]}")
 
         # ═══════════════════════════════════════════════════════════════════════════════════
         # PHASE 3: PROFESSIONAL VALUATION ENGINE
