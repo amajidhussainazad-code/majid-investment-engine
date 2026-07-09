@@ -2507,6 +2507,85 @@ elif page == "📅 Quarterly Review":
         else:
             st.warning("Some checklist items are incomplete. Review them before finalising.")
 
+    # ─── DOWNLOADABLE QUARTERLY REPORT ───
+    st.markdown("---")
+    st.markdown("### 📄 Download Quarterly Report")
+
+    def build_quarterly_report():
+        lines = []
+        lines.append("=" * 70)
+        lines.append("MCIS QUARTERLY REVIEW REPORT")
+        lines.append("Majid Capital Investment System — Blueprint v1.2")
+        lines.append(f"Review Date: {review_date.strftime('%B %d, %Y')}")
+        lines.append(f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}")
+        lines.append("=" * 70)
+
+        # Checklist status
+        lines.append("\n--- 8-STEP REVIEW CHECKLIST ---")
+        done_ct, total_ct = 0, 0
+        for step_title, step_desc, checks in steps:
+            lines.append(f"\n{step_title}")
+            for check in checks:
+                total_ct += 1
+                st_val = st.session_state.get(f"{step_title}_{check}", False)
+                if st_val: done_ct += 1
+                lines.append(f"  [{'X' if st_val else ' '}] {check}")
+        lines.append(f"\nChecklist completion: {done_ct}/{total_ct} items")
+
+        # Holdings verdicts
+        lines.append("\n--- HOLDINGS VERDICTS ---")
+        for holding in ["SPUS","SPTE","SPWO"] + [r["ticker"] for r in st.session_state.watchlist[:5]]:
+            v = st.session_state.get(f"verdict_{holding}", "HOLD")
+            lines.append(f"  {holding}: {v}")
+
+        # Committee notes
+        lines.append("\n--- COMMITTEE NOTES ---")
+        lines.append(notes if notes else "(none entered)")
+
+        # Latest scan snapshot (if available)
+        results = st.session_state.get("scan_results", [])
+        if results:
+            t1r = [r for r in results if r.get("layer")=="LONG_TERM"]
+            t2r = [r for r in results if r.get("layer")=="MID_TERM"]
+            t3r = [r for r in results if r.get("layer")=="SWING"]
+            lines.append("\n--- LATEST SCAN SNAPSHOT ---")
+            lines.append(f"Companies in system: {len(results)} | Tier 1: {len(t1r)} | Tier 2: {len(t2r)} | Tier 3: {len(t3r)}")
+            buys = [r for r in results if r.get("signal")=="🟢 BUY"]
+            waits = [r for r in results if r.get("signal")=="🟡 WAIT"]
+            checks_d = [r for r in results if r.get("signal")=="⚠️ DATA CHECK"]
+            lines.append(f"Signals: BUY {len(buys)} | WAIT {len(waits)} | DATA CHECK {len(checks_d)}")
+            if buys:
+                lines.append("\nBUY candidates:")
+                for r in sorted(buys, key=lambda x: x.get("score",0), reverse=True)[:10]:
+                    lines.append(f"  {r['ticker']:6s} {r.get('name','')[:30]:32s} "
+                                 f"${r.get('price',0):>9,.2f}  Target: {r.get('target_entry','N/A')}")
+            if waits:
+                lines.append("\nWAIT (approaching entry):")
+                for r in sorted(waits, key=lambda x: x.get("score",0), reverse=True)[:10]:
+                    lines.append(f"  {r['ticker']:6s} {r.get('name','')[:30]:32s} "
+                                 f"${r.get('price',0):>9,.2f}  Target: {r.get('target_entry','N/A')}")
+        else:
+            lines.append("\n--- LATEST SCAN SNAPSHOT ---")
+            lines.append("No scan data in session. Run Scanner before generating report for full snapshot.")
+
+        lines.append("\n--- NEXT REVIEW ---")
+        nxt = {"1":"April","4":"July","7":"October","10":"January"}.get(str(review_date.month), "next quarter")
+        lines.append(f"Scheduled: {nxt} (Jan/Apr/Jul/Oct cycle)")
+        lines.append("\n" + "=" * 70)
+        lines.append("MCIS | Models, not predictions — not investment advice")
+        return "\n".join(lines)
+
+    report_txt = build_quarterly_report()
+    st.download_button(
+        label="📥 Download Quarterly Report (.txt)",
+        data=report_txt,
+        file_name=f"MCIS_Quarterly_Review_{review_date.strftime('%Y%m%d')}.txt",
+        mime="text/plain",
+        key="dl_quarterly"
+    )
+    with st.expander("👁 Preview report"):
+        st.code(report_txt)
+
 # ═════════════════════════════════════════════
 # COMPANY DOSSIER PDF GENERATOR
 # Professional 2-page institutional dossier
