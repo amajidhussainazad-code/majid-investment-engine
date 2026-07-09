@@ -1327,7 +1327,10 @@ def results_to_df(results):
             if target_entry != "N/A" and "-" in target_entry and price > 0:
                 range_str = target_entry.replace("$", "").replace(",", "")
                 low, high = [float(x.strip()) for x in range_str.split("-")]
-                if price <= high:
+                # SANITY GUARD: target wildly detached from price = bad data, not bargain
+                if high > price * 3 or high < price * 0.25:
+                    r["signal"] = "⚠️ DATA CHECK"
+                elif price <= high:
                     r["signal"] = "🟢 BUY"
                 elif price <= high * 1.3:
                     r["signal"] = "🟡 WAIT"
