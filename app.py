@@ -929,9 +929,15 @@ def p3_etf_scan(etf_ticker):
         # Performance check for early bird status
         perf_1y = 0
         try:
-            prices = fetch_price_history(etf_ticker, days=300)
+            prices = fetch_price_history(etf_ticker, days=600)
             if len(prices) >= 200:
                 perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
+            if prices:
+                closes = [p['close'] for p in prices]
+                r['p5_high'] = max(closes)   # since inception for young ETFs
+                r['p5_low'] = min(closes)
+                r['p5_target'] = min(closes) * 0.95
+                r['price'] = prices[0]['close'] or r.get('price', 0)
         except: pass
         r['perf_1y'] = perf_1y
 
@@ -988,9 +994,15 @@ def p3_etf_scan(etf_ticker):
     # 6. Performance (20 pts) — 1yr return
     perf_1y = 0
     try:
-        prices = fetch_price_history(etf_ticker, days=300)
+        prices = fetch_price_history(etf_ticker, days=1300)  # ~5 years
         if len(prices) >= 200:
             perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
+        if prices:
+            closes = [p['close'] for p in prices]
+            r['p5_high'] = max(closes)
+            r['p5_low'] = min(closes)
+            r['p5_target'] = min(closes) * 0.95
+            r['price'] = prices[0]['close'] or r.get('price', 0)
     except: pass
     r['perf_1y'] = perf_1y
     if perf_1y > 20: details['Performance'] = 20
@@ -3678,14 +3690,19 @@ if page == "📈 ETF Monitor":
             t1_sorted = sorted(track1, key=lambda x: x.get('score', 0), reverse=True)
             df1 = pd.DataFrame([{
                 "Ticker": r['ticker'],
-                "Name": r.get('name', '')[:40],
+                "Name": r.get('name', '')[:35],
                 "Age (yrs)": f"{r.get('age_years',0):.1f}",
+                "Price": f"${r.get('price',0):.2f}" if r.get('price') else "—",
+                "5Y High": f"${r.get('p5_high',0):.2f}" if r.get('p5_high') else "—",
+                "5Y Low": f"${r.get('p5_low',0):.2f}" if r.get('p5_low') else "—",
+                "Buy Target": f"${r.get('p5_target',0):.2f}" if r.get('p5_target') else "—",
                 "1-Yr Perf": f"{r.get('perf_1y',0):+.1f}%",
                 "Score": f"{r.get('score',0)}/100",
                 "Alert": r.get('tier',''),
-                "Note": r.get('note','')[:60]
+                "Note": r.get('note','')[:50]
             } for r in t1_sorted])
             st.dataframe(df1, use_container_width=True, hide_index=True)
+            st.caption("💡 Buy Target = 5Y low × 0.95 (safety margin). Price near target + strong score = opportunity.")
 
             # Detail expanders for ORANGE zone (you decide)
             orange = [r for r in t1_sorted if "ORANGE" in r.get('tier','')]
@@ -3708,11 +3725,14 @@ if page == "📈 ETF Monitor":
         if track2:
             df2 = pd.DataFrame([{
                 "Ticker": r['ticker'],
-                "Name": r.get('name', '')[:40],
+                "Name": r.get('name', '')[:35],
                 "Age": f"{r.get('age_years',0)*12:.0f} mo",
+                "Price": f"${r.get('price',0):.2f}" if r.get('price') else "—",
+                "High (inception)": f"${r.get('p5_high',0):.2f}" if r.get('p5_high') else "—",
+                "Low (inception)": f"${r.get('p5_low',0):.2f}" if r.get('p5_low') else "—",
                 "1-Yr Perf": f"{r.get('perf_1y',0):+.1f}%" if r.get('perf_1y') else "—",
                 "Status": r.get('tier',''),
-                "Note": r.get('note','')[:70]
+                "Note": r.get('note','')[:60]
             } for r in track2])
             st.dataframe(df2, use_container_width=True, hide_index=True)
             st.caption("🚀 Early birds meeting spirit of criteria are flagged — you decide on exploratory positions (1-3%)")
