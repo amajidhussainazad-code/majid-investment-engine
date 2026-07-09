@@ -145,7 +145,7 @@ st.markdown("""
 try:
     API_KEY = st.secrets["FMP_API_KEY"]
 except Exception:
-    API_KEY = "fQUnMh24O1zf1FQ2kO7ldTELkf0qwRGz"
+    API_KEY = "bjdd20Euw6xoPRfudtkjuMzxnyPdLMHJ"
 BASE    = "https://financialmodelingprep.com/stable"
 
 NO_FLY = ["alcohol","tobacco","gambling","casino","conventional bank",
@@ -461,12 +461,35 @@ with st.sidebar:
         "Navigate",
         ["🏠 Dashboard", "🔍 Scanner", "📊 Rankings", "🔎 Company Lookup",
          "🏛 Valuation Engine", "🚨 Qualitative Alerts", "📄 Company Dossier",
+         "📈 ETF Monitor",
          "📋 Watchlist", "⚡ Swing Trades", "📅 Quarterly Review", "🔬 Data Audit"],
         label_visibility="collapsed"
     )
 
     st.markdown("---")
-    st.markdown('<p class="sidebar-text" style="font-size:0.8em">Blueprint v1.1 | Not investment advice</p>',
+    with st.expander("📖 Signal Legend"):
+        st.markdown("""
+**STOCKS:**
+- 🟢 **BUY** — Price ≤ 75% of fair value (25% margin of safety). Strong buy.
+- 🟡 **HOLD** — Fair value zone. Monitor, wait for dip.
+- 🔴 **AVOID** — Overvalued. Skip, wait for correction.
+- ⚠️ **DATA INSUFF** — <2 years history. Come back later.
+
+**ETF TRACK 1 (Ready to Buy, 2+ yrs):**
+- 🔴 **RED (80-100)** — Strongly recommend
+- 🟡 **YELLOW (70-79)** — Worth reviewing
+- 🟠 **ORANGE (60-69)** — You decide (trade-offs shown)
+- 🟢 **GREEN (40-59)** — Monitor only
+- ⚪ **SUPPRESSED (<40)** — Skip
+
+**ETF TRACK 2 (Watch List, <2 yrs):**
+- 🚀 **EARLY BIRD** — Strong start, consider 1-3% exploratory
+- 🔵 **EMERGING** — 3-12 months, monitor
+- 🟣 **DEVELOPING** — 1-2 yrs, approaching evaluation
+        """)
+
+    st.markdown("---")
+    st.markdown('<p class="sidebar-text" style="font-size:0.8em">Blueprint v1.2 | Phase 3 | Not investment advice</p>',
                 unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
@@ -529,6 +552,491 @@ def fmt_mktcap(v):
     if v >= 1e12: return f"${v/1e12:.1f}T"
     if v >= 1e9:  return f"${v/1e9:.1f}B"
     return f"${v/1e6:.0f}M"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3: PROFESSIONAL VALUATION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+RISK_FREE_RATE = 0.045      # 10-yr US Treasury (update quarterly)
+EQUITY_RISK_PREMIUM = 0.055 # Historical equity premium
+TERMINAL_GROWTH = 0.025     # Terminal growth rate
+
+def p3_fetch_history(ticker):
+    """Fetch full financial history for Phase 3 valuation."""
+    inc = fmp_get("income-statement", {"symbol": ticker, "limit": 12}) or []
+    cf  = fmp_get("cash-flow-statement", {"symbol": ticker, "limit": 12}) or []
+    bs  = fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": 12}) or []
+    prof = fmp_get("profile", {"symbol": ticker}) or []
+    km  = fmp_get("key-metrics", {"symbol": ticker, "limit": 12}) or []
+    if isinstance(inc, list): inc = sorted(inc, key=lambda x: x.get('date',''))
+    if isinstance(cf, list):  cf  = sorted(cf,  key=lambda x: x.get('date',''))
+    if isinstance(bs, list):  bs  = sorted(bs,  key=lambda x: x.get('date',''))
+    return inc, cf, bs, prof, km
+
+def p3_data_confidence(years):
+    """Data confidence based on years of history."""
+    if years >= 10: return "HIGH", 10
+    if years >= 5:  return "MEDIUM", 5
+    if years >= 2:  return "LOW", 3
+    return "UNRATED", 0
+
+def p3_quality_score(inc, cf, bs, km, years):
+    """5-factor quality scoring, 1-25 scale. Adaptive by data availability."""
+    factors = {}
+
+    # Factor 1: ROIC (from key metrics, latest)
+    roic = 0
+    try:
+        if km and isinstance(km, list):
+            latest_km = sorted(km, key=lambda x: x.get('date',''))[-1]
+            roic = (latest_km.get('roic') or latest_km.get('returnOnInvestedCapital') or 0) * 100
+    except: pass
+    if roic > 30: factors['ROIC'] = 5
+    elif roic > 20: factors['ROIC'] = 4
+    elif roic > 15: factors['ROIC'] = 3
+    elif roic > 10: factors['ROIC'] = 2
+    else: factors['ROIC'] = 1
+
+    # Factor 2: FCF Growth (latest YoY)
+    fcf_growth = 0
+    try:
+        if len(cf) >= 2:
+            f1 = cf[-2].get('freeCashFlow', 0)
+            f2 = cf[-1].get('freeCashFlow', 0)
+            if f1 and f1 > 0: fcf_growth = (f2 - f1) / f1 * 100
+    except: pass
+    if fcf_growth > 20: factors['FCF Growth'] = 5
+    elif fcf_growth > 10: factors['FCF Growth'] = 4
+    elif fcf_growth > 5: factors['FCF Growth'] = 3
+    elif fcf_growth > 0: factors['FCF Growth'] = 2
+    else: factors['FCF Growth'] = 1
+
+    # Factor 3: Revenue Growth (3-yr CAGR)
+    rev_cagr = 0
+    try:
+        n = min(4, len(inc))
+        if n >= 2:
+            r0 = inc[-n].get('revenue', 0)
+            r1 = inc[-1].get('revenue', 0)
+            if r0 and r0 > 0: rev_cagr = ((r1/r0) ** (1/(n-1)) - 1) * 100
+    except: pass
+    if rev_cagr > 20: factors['Revenue Growth'] = 5
+    elif rev_cagr > 10: factors['Revenue Growth'] = 4
+    elif rev_cagr > 5: factors['Revenue Growth'] = 3
+    elif rev_cagr > 0: factors['Revenue Growth'] = 2
+    else: factors['Revenue Growth'] = 1
+
+    # Factor 4: Balance Sheet Strength (Net Debt / EBITDA) - only if 5+ years
+    if years >= 5:
+        try:
+            latest_bs = bs[-1] if bs else {}
+            latest_inc = inc[-1] if inc else {}
+            cash = latest_bs.get('cashAndCashEquivalents', 0) or 0
+            debt = latest_bs.get('totalDebt', 0) or 0
+            ebitda = latest_inc.get('ebitda', 0) or latest_inc.get('operatingIncome', 0) or 0
+            net_debt = debt - cash
+            if net_debt <= 0:
+                factors['Balance Sheet'] = 5  # Net cash
+            elif ebitda > 0:
+                nd_ebitda = net_debt / ebitda
+                if nd_ebitda < 0.5: factors['Balance Sheet'] = 5
+                elif nd_ebitda < 1.0: factors['Balance Sheet'] = 4
+                elif nd_ebitda < 2.0: factors['Balance Sheet'] = 3
+                elif nd_ebitda < 3.0: factors['Balance Sheet'] = 2
+                else: factors['Balance Sheet'] = 1
+            else:
+                factors['Balance Sheet'] = 1
+        except:
+            factors['Balance Sheet'] = 3
+
+    # Factor 5: Margin Stability - only if 10+ years (needs 5-yr view)
+    if years >= 10:
+        try:
+            margins = []
+            for s in inc[-5:]:
+                rev = s.get('revenue', 0)
+                gp = s.get('grossProfit', 0)
+                if rev > 0: margins.append(gp/rev*100)
+            if len(margins) >= 3:
+                trend = (margins[-1] - margins[0]) / max(len(margins)-1, 1)
+                if trend > 3: factors['Margin Stability'] = 5
+                elif trend > 1: factors['Margin Stability'] = 4
+                elif trend > -2: factors['Margin Stability'] = 3
+                elif trend > -5: factors['Margin Stability'] = 2
+                else: factors['Margin Stability'] = 1
+            else:
+                factors['Margin Stability'] = 3
+        except:
+            factors['Margin Stability'] = 3
+
+    # Scale to 25 points regardless of factor count
+    n_factors = len(factors)
+    raw = sum(factors.values())
+    score_25 = round(raw / (n_factors * 5) * 25) if n_factors else 0
+    return score_25, factors, {'roic': roic, 'fcf_growth': fcf_growth, 'rev_cagr': rev_cagr}
+
+def p3_premium(score_25, confidence):
+    """Quality-linked premium, capped by data confidence."""
+    if score_25 >= 23: prem = 1.20
+    elif score_25 >= 20: prem = 1.17
+    elif score_25 >= 17: prem = 1.13
+    elif score_25 >= 14: prem = 1.10
+    elif score_25 >= 10: prem = 1.07
+    else: prem = 1.00
+    if confidence == "MEDIUM": prem = min(prem, 1.15)
+    elif confidence == "LOW": prem = min(prem, 1.10)
+    elif confidence == "UNRATED": prem = 1.00
+    return prem
+
+def p3_discount_rate(score_25, confidence):
+    """Dynamic discount rate: risk-free + equity premium + company risk."""
+    if confidence == "UNRATED":
+        company_risk = 0.05
+    elif score_25 >= 23: company_risk = 0.0025  # Elite, very stable
+    elif score_25 >= 20: company_risk = 0.01
+    elif score_25 >= 17: company_risk = 0.015
+    elif score_25 >= 14: company_risk = 0.025
+    elif score_25 >= 10: company_risk = 0.035
+    else: company_risk = 0.045
+    if confidence == "LOW": company_risk += 0.01
+    total = RISK_FREE_RATE + EQUITY_RISK_PREMIUM + company_risk
+    return total, company_risk
+
+def p3_hold_years(score_25):
+    """Quality-linked fade: how long we believe growth holds before fading."""
+    if score_25 >= 23: return 5   # Elite: hold 5 yrs
+    if score_25 >= 20: return 4
+    if score_25 >= 17: return 3
+    if score_25 >= 14: return 2
+    return 1
+
+def p3_analyst_growth(ticker, fallback):
+    """Analyst-anchored growth: consensus revenue estimates from FMP.
+    Falls back to historical CAGR if analyst data unavailable."""
+    try:
+        est = fmp_get("analyst-estimates", {"symbol": ticker, "limit": 4})
+        if est and isinstance(est, list) and len(est) >= 2:
+            est_sorted = sorted(est, key=lambda x: x.get('date', ''))
+            revs = [e.get('estimatedRevenueAvg', 0) or e.get('revenueAvg', 0) for e in est_sorted]
+            revs = [r for r in revs if r and r > 0]
+            if len(revs) >= 2:
+                g = (revs[-1] / revs[0]) ** (1 / (len(revs) - 1)) - 1
+                if -0.2 < g < 1.0:
+                    return max(0.02, min(g, 0.50)), "analyst"
+    except: pass
+    return max(0.04, min(fallback, 0.50)), "historical"
+
+def p3_tam_brake(growth, ticker, prof, inc):
+    """TAM reality brake: sustainable growth = industry growth + share-gain room.
+    Uses revenue-vs-sector proxy since exact TAM isn't in FMP."""
+    industry_growth = 0.08  # default sector growth
+    mkt_share = 0.10        # default assumed share
+    try:
+        sector = (prof[0].get('sector', '') or '').lower() if prof else ''
+        industry = (prof[0].get('industry', '') or '').lower() if prof else ''
+        # Sector growth assumptions (update as world changes)
+        if 'semiconductor' in industry or 'technology' in sector and 'hardware' in industry:
+            industry_growth = 0.25
+        elif 'software' in industry or 'internet' in industry or 'technology' in sector:
+            industry_growth = 0.14
+        elif 'health' in sector or 'biotech' in industry or 'medical' in industry:
+            industry_growth = 0.10
+        elif 'consumer' in sector and 'cyclical' in sector:
+            industry_growth = 0.06
+        elif 'consumer' in sector:
+            industry_growth = 0.04
+        elif 'industrial' in sector: industry_growth = 0.05
+        elif 'energy' in sector or 'utilities' in sector: industry_growth = 0.03
+        elif 'communication' in sector: industry_growth = 0.10
+        # Market share proxy from revenue size
+        rev = inc[-1].get('revenue', 0) if inc else 0
+        if rev > 150e9:  mkt_share = 0.35   # mega player
+        elif rev > 50e9: mkt_share = 0.20
+        elif rev > 10e9: mkt_share = 0.10
+        else:            mkt_share = 0.04   # small player, room to grow
+    except: pass
+
+    if mkt_share < 0.05:   room = 0.15
+    elif mkt_share < 0.15: room = 0.08
+    elif mkt_share < 0.30: room = 0.04
+    else:                  room = 0.01
+    ceiling = industry_growth + room
+    return min(growth, ceiling, 0.50), industry_growth, mkt_share
+
+def p3_dcf_scenario(fcf0, growth, discount, horizon, shares, hold=3):
+    """DCF with quality-linked fade: hold growth for 'hold' years, then fade to terminal."""
+    if fcf0 <= 0 or shares <= 0: return 0
+    if discount <= TERMINAL_GROWTH: discount = TERMINAL_GROWTH + 0.03
+    hold = min(hold, horizon - 1)
+    pv = 0
+    fcf = fcf0
+    for yr in range(1, horizon+1):
+        if yr <= hold:
+            g = growth
+        else:
+            g = growth - (growth - TERMINAL_GROWTH) * ((yr - hold) / (horizon - hold))
+        fcf = fcf * (1 + g)
+        pv += fcf / ((1 + discount) ** yr)
+    tv = fcf * (1 + TERMINAL_GROWTH) / (discount - TERMINAL_GROWTH)
+    pv += tv / ((1 + discount) ** horizon)
+    return pv / shares
+
+def p3_full_valuation(ticker):
+    """Complete Phase 3 valuation: analyst anchor + TAM brake + quality-linked fade."""
+    inc, cf, bs, prof, km = p3_fetch_history(ticker)
+    years = len(inc)
+
+    confidence, horizon = p3_data_confidence(years)
+    result = {'ticker': ticker, 'years': years, 'confidence': confidence, 'horizon': horizon}
+
+    if confidence == "UNRATED":
+        result['signal'] = "⚠️ DATA INSUFF"
+        result['note'] = f"Only {years} year(s) of history. Reassess after 2+ years."
+        return result
+
+    # Quality score
+    score_25, factors, metrics = p3_quality_score(inc, cf, bs, km, years)
+    result['quality_score'] = score_25
+    result['factors'] = factors
+    result['metrics'] = metrics
+
+    # Premium & discount rate
+    premium = p3_premium(score_25, confidence)
+    disc, company_risk = p3_discount_rate(score_25, confidence)
+    result['premium'] = premium
+    result['discount_rate'] = disc
+    result['company_risk'] = company_risk
+
+    # Current price & shares
+    price = 0; shares = 0; company_name = ticker
+    try:
+        if prof and isinstance(prof, list):
+            price = prof[0].get('price', 0) or 0
+            mktcap = prof[0].get('mktCap', 0) or 0
+            company_name = prof[0].get('companyName', ticker)
+            if price > 0: shares = mktcap / price
+    except: pass
+    if shares <= 0:
+        try: shares = inc[-1].get('weightedAverageShsOut', 0) or 0
+        except: pass
+    result['price'] = price
+    result['company'] = company_name
+
+    # Base FCF (latest, or 3-yr average if volatile)
+    fcf0 = 0
+    try:
+        recent_fcf = [c.get('freeCashFlow', 0) for c in cf[-3:]]
+        fcf0 = recent_fcf[-1] if recent_fcf else 0
+        if fcf0 <= 0 and len(recent_fcf) >= 2:
+            fcf0 = sum(recent_fcf) / len(recent_fcf)
+    except: pass
+
+    if fcf0 <= 0 or shares <= 0 or price <= 0:
+        result['signal'] = "⚠️ DATA INSUFF"
+        result['note'] = "Missing FCF, shares, or price data."
+        return result
+
+    # ─── GROWTH: Analyst anchor → TAM brake ───
+    analyst_g, g_source = p3_analyst_growth(ticker, metrics['rev_cagr']/100)
+    braked_g, ind_growth, mkt_share = p3_tam_brake(analyst_g, ticker, prof, inc)
+    hold = p3_hold_years(score_25)
+    result['analyst_growth'] = analyst_g
+    result['growth_source'] = g_source
+    result['braked_growth'] = braked_g
+    result['industry_growth'] = ind_growth
+    result['mkt_share_proxy'] = mkt_share
+    result['hold_years'] = hold
+
+    # Scenario distribution by confidence
+    if confidence == "HIGH":   w = (0.25, 0.50, 0.25)
+    elif confidence == "MEDIUM": w = (0.30, 0.50, 0.20)
+    else: w = (0.40, 0.40, 0.20)
+
+    bear = p3_dcf_scenario(fcf0 * 0.85, braked_g * 0.7, disc + 0.01, horizon, shares, hold)
+    base = p3_dcf_scenario(fcf0, braked_g, disc, horizon, shares, hold)
+    bull = p3_dcf_scenario(fcf0 * 1.10, min(braked_g * 1.2, 0.50), disc - 0.005, horizon, shares, hold)
+
+    intrinsic = bear * w[0] + base * w[1] + bull * w[2]
+    fair_value = intrinsic * premium
+
+    result['bear'] = bear
+    result['base'] = base
+    result['bull'] = bull
+    result['weights'] = w
+    result['intrinsic'] = intrinsic
+    result['fair_value'] = fair_value
+
+    # Signal (25% margin of safety)
+    buy_below = fair_value * 0.75
+    result['buy_below'] = buy_below
+    expected_return = (fair_value - price) / price * 100 if price > 0 else 0
+    result['expected_return'] = expected_return
+
+    if price <= buy_below:
+        result['signal'] = "🟢 BUY"
+        result['action'] = f"Strong buy — {expected_return:.0f}% upside to fair value"
+    elif price <= fair_value:
+        result['signal'] = "🟡 HOLD"
+        result['action'] = f"Fair value zone — wait for ${buy_below:.0f} entry"
+    else:
+        result['signal'] = "🔴 AVOID"
+        result['action'] = f"Overvalued by {-expected_return:.0f}% — target entry ${buy_below:.0f}"
+
+    # Position sizing
+    if result['signal'] == "🟢 BUY":
+        if score_25 >= 20: result['allocation'] = "4-5% of portfolio"
+        elif score_25 >= 14: result['allocation'] = "2-3% of portfolio"
+        else: result['allocation'] = "1-2% of portfolio"
+    else:
+        result['allocation'] = "0% — wait for entry price"
+
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3: ETF OPPORTUNITY MONITOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+ETF_UNIVERSE = ["SPUS", "HLAL", "SPTE", "SPWO", "UMMA", "SPSK", "ETHS", "HIWO", "ISWD", "ISDW", "WSHR"]
+CURRENT_HOLDINGS = ["SPUS", "ETHS"]
+
+def p3_etf_scan(etf_ticker):
+    """Score an ETF against MCIS criteria. Returns dict with score + tier."""
+    r = {'ticker': etf_ticker, 'score': 0, 'details': {}}
+
+    prof = fmp_get("profile", {"symbol": etf_ticker}) or []
+    if not prof or not isinstance(prof, list) or len(prof) == 0:
+        r['tier'] = "⚪ NOT FOUND"
+        r['note'] = "No data available from FMP"
+        return r
+
+    p = prof[0]
+    r['name'] = p.get('companyName', etf_ticker)
+    r['price'] = p.get('price', 0)
+    ipo = p.get('ipoDate', '') or ''
+    r['ipo'] = ipo
+
+    # Age in years
+    age_years = 0
+    try:
+        from datetime import datetime as dt
+        ipo_dt = dt.strptime(ipo[:10], "%Y-%m-%d")
+        age_years = (dt.now() - ipo_dt).days / 365.25
+    except: pass
+    r['age_years'] = age_years
+
+    # TRACK 2: Watch list for young ETFs
+    if age_years < 2:
+        # Performance check for early bird status
+        perf_1y = 0
+        try:
+            hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
+            prices = hist.get('historical', []) if isinstance(hist, dict) else []
+            if len(prices) >= 200:
+                perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
+        except: pass
+        r['perf_1y'] = perf_1y
+
+        if age_years < 0.25:
+            r['tier'] = "🔵 EMERGING"
+            r['note'] = f"Launched {age_years*12:.0f} months ago — too new, monitor"
+        elif age_years < 1:
+            if perf_1y > 15:
+                r['tier'] = "🚀 EARLY BIRD"
+                r['note'] = f"Strong start (+{perf_1y:.0f}%) — consider 1-3% exploratory position"
+            else:
+                r['tier'] = "🔵 EMERGING"
+                r['note'] = f"{age_years*12:.0f} months old — monitoring performance"
+        else:
+            r['tier'] = "🟣 DEVELOPING"
+            months_to_eval = max(0, (2 - age_years) * 12)
+            r['note'] = f"Approaching maturity — formal evaluation in ~{months_to_eval:.0f} months"
+        r['track'] = 2
+        return r
+
+    # TRACK 1: Formal scoring (100 points)
+    score = 0
+    details = {}
+
+    # 1. Halal compliance (10 pts) — universe is pre-screened halal ETFs
+    details['Halal'] = 10
+    score += 10
+
+    # 2. Geographic diversification (15 pts)
+    name_lower = r['name'].lower()
+    if any(k in name_lower for k in ['world', 'global', 'international']):
+        details['Diversification'] = 15
+    elif any(k in name_lower for k in ['emerging', 'asia', 'europe']):
+        details['Diversification'] = 12
+    else:
+        details['Diversification'] = 8  # US-only
+    score += details['Diversification']
+
+    # 3. Track record (20 pts)
+    if age_years >= 10: details['Track Record'] = 20
+    elif age_years >= 5: details['Track Record'] = 16
+    elif age_years >= 3: details['Track Record'] = 12
+    else: details['Track Record'] = 8
+    score += details['Track Record']
+
+    # 4. Accessibility (10 pts) — listed & tradeable
+    details['Access'] = 10 if r['price'] > 0 else 0
+    score += details['Access']
+
+    # 5. Expense ratio (15 pts) — estimate; most halal ETFs 0.4-0.5%
+    details['Expense'] = 12
+    score += 12
+
+    # 6. Performance (20 pts) — 1yr return
+    perf_1y = 0
+    try:
+        hist = fmp_get("historical-price-full", {"symbol": etf_ticker, "serietype": "line"})
+        prices = hist.get('historical', []) if isinstance(hist, dict) else []
+        if len(prices) >= 200:
+            perf_1y = (prices[0]['close'] / prices[min(251, len(prices)-1)]['close'] - 1) * 100
+    except: pass
+    r['perf_1y'] = perf_1y
+    if perf_1y > 20: details['Performance'] = 20
+    elif perf_1y > 12: details['Performance'] = 16
+    elif perf_1y > 6: details['Performance'] = 12
+    elif perf_1y > 0: details['Performance'] = 8
+    else: details['Performance'] = 4
+    score += details['Performance']
+
+    # 7. Overlap (10 pts) — holdings vs current
+    if etf_ticker in CURRENT_HOLDINGS:
+        details['Overlap'] = 5  # It IS a holding
+    elif etf_ticker in ["HLAL"]:  # Known SPUS near-duplicate
+        details['Overlap'] = 3
+    elif etf_ticker in ["HIWO", "ISWD", "ISDW"]:  # Known ETHS near-duplicates
+        details['Overlap'] = 4
+    else:
+        details['Overlap'] = 8
+    score += details['Overlap']
+
+    r['score'] = score
+    r['details'] = details
+    r['track'] = 1
+
+    if score >= 80:
+        r['tier'] = "🔴 RED ALERT"
+        r['note'] = "Strongly recommend — serious consideration for allocation"
+    elif score >= 70:
+        r['tier'] = "🟡 YELLOW ALERT"
+        r['note'] = "Worth reviewing — good candidate"
+    elif score >= 60:
+        r['tier'] = "🟠 ORANGE ALERT"
+        r['note'] = "You decide — meets 60-70% of criteria, trade-offs below"
+    elif score >= 40:
+        r['tier'] = "🟢 GREEN INFO"
+        r['note'] = "Monitor only — not ready"
+    else:
+        r['tier'] = "⚪ SUPPRESSED"
+        r['note'] = "Does not meet criteria — skip"
+
+    if etf_ticker in CURRENT_HOLDINGS:
+        r['note'] = "✅ CURRENT HOLDING — " + r['note']
+
+    return r
 
 def analyze_etf_prices(etf_ticker):
     """Fetch and analyze 5-year ETF price history with caching"""
@@ -2419,8 +2927,88 @@ if page == "📄 Company Dossier":
                              height=100, key="risks")
 
         # ═══════════════════════════════════════════════════════════════════════════════════
-        # PHASE 2: REAL FINANCIAL STATEMENTS — 5-Year History
+        # PHASE 3: PROFESSIONAL VALUATION ENGINE
         # ═══════════════════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown('<div class="section-header">🏛 Phase 3 Valuation — Institutional DCF Analysis</div>', unsafe_allow_html=True)
+
+        if st.button("🚀 Run Full Valuation", key="p3_run"):
+            with st.spinner(f"Running institutional valuation for {dos_ticker}..."):
+                st.session_state["p3_result"] = p3_full_valuation(dos_ticker)
+
+        p3 = st.session_state.get("p3_result")
+        if p3 and p3.get('ticker') == dos_ticker:
+            if p3.get('signal') == "⚠️ DATA INSUFF":
+                st.warning(f"⚠️ **DATA INSUFFICIENT** — {p3.get('note','')}")
+            else:
+                # Signal banner
+                sig = p3['signal']
+                if "BUY" in sig:
+                    st.success(f"## {sig} — {p3.get('action','')}")
+                elif "HOLD" in sig:
+                    st.info(f"## {sig} — {p3.get('action','')}")
+                else:
+                    st.error(f"## {sig} — {p3.get('action','')}")
+
+                # Quality Score
+                st.subheader(f"⭐ Quality Score: {p3['quality_score']}/25 | Data Confidence: {p3['confidence']} ({p3['years']} yrs)")
+                fcols = st.columns(len(p3['factors']))
+                for i, (fname, fscore) in enumerate(p3['factors'].items()):
+                    with fcols[i]:
+                        st.metric(fname, f"{fscore}/5 ⭐")
+
+                st.markdown("---")
+
+                # Discount rate breakdown
+                st.subheader("💰 Discount Rate Breakdown")
+                d1, d2, d3, d4 = st.columns(4)
+                with d1: st.metric("Risk-Free Rate", f"{RISK_FREE_RATE*100:.1f}%", "10-yr Treasury")
+                with d2: st.metric("Equity Premium", f"{EQUITY_RISK_PREMIUM*100:.1f}%", "Market standard")
+                with d3: st.metric("Company Risk", f"+{p3['company_risk']*100:.2f}%", "Quality-based")
+                with d4: st.metric("Total Discount Rate", f"{p3['discount_rate']*100:.2f}%")
+
+                st.markdown("---")
+
+                # Growth assumptions (transparency)
+                st.subheader("📈 Growth Assumptions (Analyst + TAM Brake)")
+                g1, g2, g3, g4 = st.columns(4)
+                with g1: st.metric("Analyst Growth", f"{p3.get('analyst_growth',0)*100:.0f}%",
+                                   f"Source: {p3.get('growth_source','')}")
+                with g2: st.metric("Industry Growth", f"{p3.get('industry_growth',0)*100:.0f}%",
+                                   f"Share proxy: {p3.get('mkt_share_proxy',0)*100:.0f}%")
+                with g3: st.metric("Growth Used (Braked)", f"{p3.get('braked_growth',0)*100:.0f}%",
+                                   "After TAM brake")
+                with g4: st.metric("Growth Hold Period", f"{p3.get('hold_years',3)} years",
+                                   f"Quality-linked (Q{p3['quality_score']}/25)")
+                st.caption("💡 Growth = analyst consensus, capped by industry capacity (TAM), held longer for higher-quality companies, then fades to 2.5% terminal")
+
+                st.markdown("---")
+
+                # Three-scenario DCF
+                st.subheader(f"📊 Three-Scenario DCF ({p3['horizon']}-Year Forecast)")
+                w = p3['weights']
+                s1, s2, s3 = st.columns(3)
+                with s1: st.metric(f"🐻 Bear Case ({w[0]*100:.0f}%)", f"${p3['bear']:.2f}")
+                with s2: st.metric(f"📊 Base Case ({w[1]*100:.0f}%)", f"${p3['base']:.2f}")
+                with s3: st.metric(f"🚀 Bull Case ({w[2]*100:.0f}%)", f"${p3['bull']:.2f}")
+
+                st.markdown("---")
+
+                # Fair value & signal detail
+                st.subheader("🎯 Fair Value & Investment Decision")
+                v1, v2, v3, v4 = st.columns(4)
+                with v1: st.metric("Intrinsic Value", f"${p3['intrinsic']:.2f}", "Probability-weighted")
+                with v2: st.metric("Quality Premium", f"{p3['premium']:.2f}x", f"Score {p3['quality_score']}/25")
+                with v3: st.metric("Fair Value", f"${p3['fair_value']:.2f}", "Intrinsic × Premium")
+                with v4: st.metric("Current Price", f"${p3['price']:.2f}",
+                                   f"{p3['expected_return']:+.0f}% to fair value")
+
+                b1, b2 = st.columns(2)
+                with b1: st.metric("🎯 Target Entry (25% MoS)", f"${p3['buy_below']:.2f}")
+                with b2: st.metric("💼 Suggested Allocation", p3['allocation'])
+
+                st.caption("💡 BUY when price ≤ target entry | Legend in sidebar 📖")
+
         
         st.markdown("---")
         st.markdown('<div class="section-header">📊 Financial Statements — 5-Year History</div>', unsafe_allow_html=True)
@@ -3008,6 +3596,100 @@ def moat_assessment(d, v):
 # ─────────────────────────────────────────────
 # PAGE: VALUATION ENGINE
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# PHASE 3: ETF OPPORTUNITY MONITOR
+# ─────────────────────────────────────────────
+if page == "📈 ETF Monitor":
+    st.markdown("""
+    <div class="mcis-header">
+        <p class="mcis-title">📈 ETF Opportunity Monitor</p>
+        <p class="mcis-subtitle">Track 1: Ready to Buy (2+ yrs) | Track 2: Early Bird Watch List (&lt;2 yrs)</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.info(f"📌 **Current Holdings:** {', '.join(CURRENT_HOLDINGS)} | **Universe scanned:** {len(ETF_UNIVERSE)} halal ETFs | Legend in sidebar 📖")
+
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        run_etf = st.button("🔍 Run ETF Scan Now", key="etf_scan_btn", use_container_width=True)
+    with col_b:
+        custom_etf = st.text_input("Or scan a specific ETF ticker", placeholder="e.g. SPRE", key="custom_etf").upper().strip()
+
+    if run_etf:
+        results = []
+        prog = st.progress(0)
+        for i, t in enumerate(ETF_UNIVERSE):
+            results.append(p3_etf_scan(t))
+            prog.progress((i+1)/len(ETF_UNIVERSE))
+        prog.empty()
+        st.session_state["etf_results"] = results
+
+    if custom_etf:
+        with st.spinner(f"Scanning {custom_etf}..."):
+            single = p3_etf_scan(custom_etf)
+        st.subheader(f"Result: {custom_etf}")
+        st.write(f"**{single.get('tier','')}** — {single.get('note','')}")
+        if single.get('track') == 1:
+            st.write(f"Score: **{single['score']}/100** | Age: {single.get('age_years',0):.1f} yrs | 1-Yr Perf: {single.get('perf_1y',0):+.1f}%")
+            with st.expander("Score breakdown"):
+                for k, val in single.get('details', {}).items():
+                    st.write(f"- {k}: {val} pts")
+
+    etf_results = st.session_state.get("etf_results")
+    if etf_results:
+        track1 = [r for r in etf_results if r.get('track') == 1]
+        track2 = [r for r in etf_results if r.get('track') == 2]
+
+        st.markdown("---")
+        st.subheader("📊 TRACK 1 — Ready to Buy (2+ Years History)")
+        if track1:
+            t1_sorted = sorted(track1, key=lambda x: x.get('score', 0), reverse=True)
+            df1 = pd.DataFrame([{
+                "Ticker": r['ticker'],
+                "Name": r.get('name', '')[:40],
+                "Age (yrs)": f"{r.get('age_years',0):.1f}",
+                "1-Yr Perf": f"{r.get('perf_1y',0):+.1f}%",
+                "Score": f"{r.get('score',0)}/100",
+                "Alert": r.get('tier',''),
+                "Note": r.get('note','')[:60]
+            } for r in t1_sorted])
+            st.dataframe(df1, use_container_width=True, hide_index=True)
+
+            # Detail expanders for ORANGE zone (you decide)
+            orange = [r for r in t1_sorted if "ORANGE" in r.get('tier','')]
+            if orange:
+                st.markdown("#### 🟠 Orange Zone — Your Decision")
+                for r in orange:
+                    with st.expander(f"🟠 {r['ticker']} — {r.get('score',0)}/100 — Review trade-offs"):
+                        st.write(f"**{r.get('name','')}**")
+                        st.write("**Criteria breakdown:**")
+                        for k, val in r.get('details', {}).items():
+                            emoji = "✅" if val >= 12 else "⚠️" if val >= 8 else "❌"
+                            st.write(f"{emoji} {k}: {val} pts")
+                        st.write(f"**MCIS View:** {r.get('note','')}")
+                        st.write("**Your call:** Review the trade-offs above and decide.")
+        else:
+            st.info("No Track 1 ETFs found. Run the scan.")
+
+        st.markdown("---")
+        st.subheader("🚀 TRACK 2 — Early Bird Watch List (<2 Years)")
+        if track2:
+            df2 = pd.DataFrame([{
+                "Ticker": r['ticker'],
+                "Name": r.get('name', '')[:40],
+                "Age": f"{r.get('age_years',0)*12:.0f} mo",
+                "1-Yr Perf": f"{r.get('perf_1y',0):+.1f}%" if r.get('perf_1y') else "—",
+                "Status": r.get('tier',''),
+                "Note": r.get('note','')[:70]
+            } for r in track2])
+            st.dataframe(df2, use_container_width=True, hide_index=True)
+            st.caption("🚀 Early birds meeting spirit of criteria are flagged — you decide on exploratory positions (1-3%)")
+        else:
+            st.info("No emerging ETFs (<2 yrs) currently in the universe. New launches will appear here.")
+
+        st.markdown("---")
+        st.caption("⏰ Quarterly reminder: Re-run this scan in Jan / Apr / Jul / Oct — or anytime on demand.")
 
 if page == "🏛 Valuation Engine":
     st.markdown("""
