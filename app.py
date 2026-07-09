@@ -1318,6 +1318,26 @@ def results_to_df(results):
         except:
             pass
         
+        # Store back into result dict so signal logic can use it (FIX for ⚠️ ANALYZE bug)
+        r["target_entry"] = target_entry
+        
+        # Compute signal here directly (single source of truth)
+        try:
+            price = float(r.get("price", 0) or 0)
+            if target_entry != "N/A" and "-" in target_entry and price > 0:
+                range_str = target_entry.replace("$", "").replace(",", "")
+                low, high = [float(x.strip()) for x in range_str.split("-")]
+                if price <= high:
+                    r["signal"] = "🟢 BUY"
+                elif price <= high * 1.3:
+                    r["signal"] = "🟡 WAIT"
+                else:
+                    r["signal"] = "🔴 AVOID"
+            else:
+                r["signal"] = "⚠️ ANALYZE"
+        except:
+            r["signal"] = "⚠️ ANALYZE"
+        
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -1762,25 +1782,10 @@ if page == "🏠 Dashboard":
         # ═══════════════════════════════════════════════════════════
         st.markdown('<div class="section-header">🟢 READY TO BUY NOW — Action Items</div>', unsafe_allow_html=True)
         
-        buy_now = []
-        for r in t1:
-            try:
-                price = float(r.get("price", 0) or 0)
-                target_entry = r.get("target_entry", "N/A")
-                
-                if target_entry != "N/A" and "-" in target_entry:
-                    try:
-                        range_str = target_entry.replace("$", "").replace(",", "")
-                        low, high = [float(x.strip()) for x in range_str.split("-")]
-                        
-                        # If current price is at or below target entry = BUY NOW
-                        if price <= high:
-                            r["buy_signal"] = "🟢 BUY"
-                            buy_now.append(r)
-                    except:
-                        pass
-            except:
-                pass
+        # Populate target_entry + signal for ALL results (t1+t2+t3) before any logic
+        _ = results_to_df(results)  # side effect: sets r["target_entry"] and r["signal"]
+        
+        buy_now = [r for r in t1 if r.get("signal") == "🟢 BUY"]
         
         if buy_now:
             st.markdown(f"**🎯 {len(buy_now)} companies ready to buy** — within Target Entry range, excellent opportunities!")
@@ -1846,29 +1851,7 @@ if page == "🏠 Dashboard":
         st.markdown('<div class="section-header">🏆 All Tier 1 Companies — With Signals</div>', unsafe_allow_html=True)
         
         if t1:
-            # Add signal to each Tier 1 company
-            for r in t1:
-                try:
-                    price = float(r.get("price", 0) or 0)
-                    target_entry = r.get("target_entry", "N/A")
-                    
-                    if target_entry != "N/A" and "-" in target_entry:
-                        try:
-                            range_str = target_entry.replace("$", "").replace(",", "")
-                            low, high = [float(x.strip()) for x in range_str.split("-")]
-                            
-                            if price <= high:
-                                r["signal"] = "🟢 BUY"
-                            elif price <= high * 1.3:
-                                r["signal"] = "🟡 WAIT"
-                            else:
-                                r["signal"] = "🔴 AVOID"
-                        except:
-                            r["signal"] = "⚠️ ANALYZE"
-                    else:
-                        r["signal"] = "⚠️ ANALYZE"
-                except:
-                    r["signal"] = "⚠️ ANALYZE"
+            # Signals already computed by results_to_df(results) above
             
             # PHASE 1: PILL BUTTON FILTER
             # Initialize session state for signal filter
@@ -1921,6 +1904,31 @@ if page == "🏠 Dashboard":
             
         else:
             st.info("No Tier 1 results yet. Run the scanner first.")
+
+        # ─── TIER 2 & TIER 3 TABLES ───
+        st.markdown('<div class="section-header">🥈 Tier 2 — Watch (Good Quality, 1 Filter Miss)</div>', unsafe_allow_html=True)
+        if t2:
+            with st.expander(f"Show {len(t2)} Tier 2 companies", expanded=False):
+                t2_sorted = sorted(t2, key=lambda x: x["score"], reverse=True)
+                df_t2 = results_to_df(t2_sorted)
+                df_t2["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in t2_sorted]
+                st.dataframe(df_t2[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
+                            use_container_width=True, hide_index=True)
+                st.caption("💡 Tier 2 = strong fundamentals, one criterion missed. 🟢 BUY here = good company at a great price — smaller position size (2-3%) than Tier 1.")
+        else:
+            st.info("No Tier 2 companies in latest scan.")
+
+        st.markdown('<div class="section-header">🥉 Tier 3 — Monitor (Swing / Tactical Candidates)</div>', unsafe_allow_html=True)
+        if t3:
+            with st.expander(f"Show {len(t3)} Tier 3 companies", expanded=False):
+                t3_sorted = sorted(t3, key=lambda x: x["score"], reverse=True)
+                df_t3 = results_to_df(t3_sorted)
+                df_t3["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in t3_sorted]
+                st.dataframe(df_t3[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
+                            use_container_width=True, hide_index=True)
+                st.caption("💡 Tier 3 = lower quality or 2 filter misses. Even at 🟢 BUY prices — swing/tactical only, max 5% of portfolio combined.")
+        else:
+            st.info("No Tier 3 companies in latest scan.")
 
         # Fair Value Opportunities Snapshot
         st.markdown('<div class="section-header">💎 Fair Value Opportunities — Quick Glance</div>', unsafe_allow_html=True)
