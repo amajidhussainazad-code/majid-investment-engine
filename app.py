@@ -899,18 +899,98 @@ def p3_full_valuation(ticker):
 ETF_UNIVERSE = ["SPUS", "HLAL", "SPTE", "SPWO", "UMMA", "SPSK", "ETHS", "HIWO", "ISWD", "ISDW", "WSHR"]
 CURRENT_HOLDINGS = ["SPUS", "ETHS"]
 
+# Foreign-listed halal ETFs: FMP suffix attempts + Yahoo symbols
+FOREIGN_ETF_MAP = {
+    "ETHS": {"fmp_alts": ["ETHS.TO"], "yahoo": "ETHS.TO", "name": "iShares Global Halal (TSX)"},
+    "HIWO": {"fmp_alts": ["HIWO.L", "HIWO.MI"], "yahoo": "HIWO.L", "name": "iShares MSCI World Islamic (EU)"},
+    "ISWD": {"fmp_alts": ["ISWD.L"], "yahoo": "ISWD.L", "name": "iShares MSCI World Islamic (LSE)"},
+    "ISDW": {"fmp_alts": ["ISDW.L"], "yahoo": "ISDW.L", "name": "iShares MSCI World Islamic Dist (LSE)"},
+    "WSHR": {"fmp_alts": ["WSHR.NE", "WSHR.TO"], "yahoo": "WSHR.NE", "name": "Wealthsimple Shariah World (TSX)"},
+}
+
+def fetch_yahoo_prices(yahoo_symbol, years=5):
+    """Yahoo Finance fallback for non-US listings. Returns (prices, status_msg).
+    prices = list of {'date','close'} newest-first, or []."""
+    try:
+        import urllib.request, json as _json
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+               f"?range={years}y&interval=1d")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
+        result = data.get("chart", {}).get("result")
+        if not result:
+            err = data.get("chart", {}).get("error", {})
+            return [], f"Yahoo: no data ({err.get('code','unknown')})"
+        res = result[0]
+        ts = res.get("timestamp", [])
+        closes = res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        from datetime import datetime as _dt
+        out = []
+        for t, c in zip(ts, closes):
+            if c:
+                out.append({"date": _dt.utcfromtimestamp(t).strftime("%Y-%m-%d"), "close": float(c)})
+        out.sort(key=lambda x: x["date"], reverse=True)
+        if out:
+            return out, f"Yahoo: OK ✅ ({yahoo_symbol})"
+        return [], "Yahoo: empty response"
+    except Exception as e:
+        emsg = str(e)[:40]
+        if "429" in emsg: return [], "Yahoo: HTTP 429 rate-limited (retry later)"
+        if "404" in emsg: return [], f"Yahoo: ticker {yahoo_symbol} not found"
+        return [], f"Yahoo: failed ({emsg})"
+
+def fetch_prices_with_diagnosis(ticker):
+    """Full chain: FMP → FMP suffixed → Yahoo. Returns (prices, source_trail)."""
+    trail = []
+    # 1) FMP normal
+    prices = fetch_price_history(ticker, days=1300)
+    if prices:
+        return prices, "FMP ✅"
+    trail.append(f"FMP: no data ({ticker}")
+    # 2) FMP suffixed alternates
+    fmap = FOREIGN_ETF_MAP.get(ticker, {})
+    for alt in fmap.get("fmp_alts", []):
+        prices = fetch_price_history(alt, days=1300)
+        if prices:
+            return prices, f"FMP ✅ (as {alt})"
+        trail[0] += f", {alt}"
+    trail[0] += " tried)"
+    # 3) Yahoo
+    yh = fmap.get("yahoo")
+    if yh:
+        prices, ymsg = fetch_yahoo_prices(yh)
+        trail.append(ymsg)
+        if prices:
+            return prices, " | ".join(trail[:-1] + [ymsg])
+    else:
+        trail.append("Yahoo: no symbol mapped")
+    return [], " | ".join(trail)
+
 def p3_etf_scan(etf_ticker):
     """Score an ETF against MCIS criteria. Returns dict with score + tier."""
     r = {'ticker': etf_ticker, 'score': 0, 'details': {}}
 
     prof = fmp_get("profile", {"symbol": etf_ticker}) or []
     if not prof or not isinstance(prof, list) or len(prof) == 0:
-        r['tier'] = "⚪ NOT COVERED"
-        r['note'] = "Not covered by FMP (likely non-US listing) — track manually on IBKR"
+        # Foreign/uncovered: try FMP-suffixed → Yahoo chain with diagnosis
+        fmap = FOREIGN_ETF_MAP.get(etf_ticker, {})
+        r['name'] = fmap.get('name', "Non-US listed halal ETF")
+        prices, trail = fetch_prices_with_diagnosis(etf_ticker)
+        if prices:
+            closes = [p['close'] for p in prices]
+            r['price'] = closes[0]
+            r['p5_high'] = max(closes)
+            r['p5_low'] = min(closes)
+            r['p5_target'] = min(closes) * 0.95
+            if len(prices) >= 200:
+                r['perf_1y'] = (closes[0] / closes[min(251, len(closes)-1)] - 1) * 100
+            r['tier'] = "🌍 PRICE-ONLY"
+            r['note'] = f"{trail} | No FMP fundamentals — price data only, score N/A"
+        else:
+            r['tier'] = "⚪ NOT COVERED"
+            r['note'] = f"{trail} | → track manually on IBKR"
         r['track'] = 3
-        r['name'] = {"ETHS":"iShares Global Halal (TSX)", "HIWO":"iShares MSCI World Islamic (EU)",
-                     "ISWD":"iShares MSCI World Islamic (LSE)", "ISDW":"iShares MSCI World Islamic Dist (LSE)",
-                     "WSHR":"Wealthsimple Shariah World (TSX)"}.get(etf_ticker, "Non-US listed halal ETF")
         return r
 
     p = prof[0]
@@ -3743,19 +3823,24 @@ if page == "📈 ETF Monitor":
         else:
             st.info("No emerging ETFs (<2 yrs) currently in the universe. New launches will appear here.")
 
-        # Track 3: Non-US listed / not covered by FMP
+        # Track 3: Non-US listed — price via fallback chain (FMP suffixed → Yahoo)
         track3 = [r for r in etf_results if r.get('track') == 3]
         if track3:
             st.markdown("---")
-            st.subheader("⚪ NOT COVERED BY FMP — Track Manually")
+            st.subheader("🌍 NON-US LISTED — Price via Fallback (FMP→Yahoo)")
             df3 = pd.DataFrame([{
                 "Ticker": r['ticker'],
                 "Name": r.get('name',''),
+                "Price": f"${r.get('price',0):.2f}" if r.get('price') else "—",
+                "5Y High": f"${r.get('p5_high',0):.2f}" if r.get('p5_high') else "—",
+                "5Y Low": f"${r.get('p5_low',0):.2f}" if r.get('p5_low') else "—",
+                "Buy Target": f"${r.get('p5_target',0):.2f}" if r.get('p5_target') else "—",
+                "1-Yr Perf": f"{r.get('perf_1y',0):+.1f}%" if r.get('perf_1y') else "—",
                 "Status": r.get('tier',''),
-                "Action": r.get('note','')
+                "Diagnosis / Source": r.get('note','')
             } for r in track3])
             st.dataframe(df3, use_container_width=True, hide_index=True)
-            st.caption("💡 These are non-US listings (Toronto/London/EU exchanges). FMP doesn't cover them — check prices directly on IBKR. ETHS & HIWO remain part of your strategy; MCIS just can't auto-score them.")
+            st.caption("💡 🌍 PRICE-ONLY = price data rescued via fallback (currency = local exchange, e.g. CAD/GBP). No FMP fundamentals → no 0-100 score. ⚪ NOT COVERED = all sources failed — diagnosis column shows exactly where the chain broke.")
 
         st.markdown("---")
         st.caption("⏰ Quarterly reminder: Re-run this scan in Jan / Apr / Jul / Oct — or anytime on demand.")
