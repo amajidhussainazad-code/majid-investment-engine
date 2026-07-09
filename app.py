@@ -905,8 +905,12 @@ def p3_etf_scan(etf_ticker):
 
     prof = fmp_get("profile", {"symbol": etf_ticker}) or []
     if not prof or not isinstance(prof, list) or len(prof) == 0:
-        r['tier'] = "⚪ NOT FOUND"
-        r['note'] = "No data available from FMP"
+        r['tier'] = "⚪ NOT COVERED"
+        r['note'] = "Not covered by FMP (likely non-US listing) — track manually on IBKR"
+        r['track'] = 3
+        r['name'] = {"ETHS":"iShares Global Halal (TSX)", "HIWO":"iShares MSCI World Islamic (EU)",
+                     "ISWD":"iShares MSCI World Islamic (LSE)", "ISDW":"iShares MSCI World Islamic Dist (LSE)",
+                     "WSHR":"Wealthsimple Shariah World (TSX)"}.get(etf_ticker, "Non-US listed halal ETF")
         return r
 
     p = prof[0]
@@ -1628,7 +1632,7 @@ if page == "🏠 Dashboard":
     st.markdown("""
     <div class="mcis-header">
         <p class="mcis-title">📊 MCIS Dashboard</p>
-        <p class="mcis-subtitle">Majid Capital Investment System — Blueprint v1.1</p>
+        <p class="mcis-subtitle">Majid Capital Investment System — Blueprint v1.2</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1656,7 +1660,7 @@ if page == "🏠 Dashboard":
         st.markdown("""
         <div class="info-box">
         👆 Go to <b>🔍 Scanner</b> in the sidebar to run your first MCIS market scan.
-        The scanner will analyse 300+ companies against MCIS Blueprint v1.1 criteria
+        The scanner will analyse 300+ companies against MCIS Blueprint v1.2 criteria
         and populate this dashboard with real results.
         </div>
         """, unsafe_allow_html=True)
@@ -1886,7 +1890,7 @@ elif page == "🔍 Scanner":
     st.markdown("""
     <div class="mcis-header">
         <p class="mcis-title">🔍 MCIS Scanner</p>
-        <p class="mcis-subtitle">Real-time market scanning against Blueprint v1.1 criteria</p>
+        <p class="mcis-subtitle">Real-time market scanning against Blueprint v1.2 criteria</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2346,7 +2350,7 @@ elif page == "📅 Quarterly Review":
     st.markdown("""
     <div class="mcis-header">
         <p class="mcis-title">📅 Quarterly Review</p>
-        <p class="mcis-subtitle">MCIS Blueprint v1.1 — 8-Step Review Process</div>
+        <p class="mcis-subtitle">MCIS Blueprint v1.2 — 8-Step Review Process</div>
     """, unsafe_allow_html=True)
 
     st.markdown("""
@@ -2800,7 +2804,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     
     # Footer
     story.append(Paragraph(f"MCIS Company Dossier | Generated {datetime.now().strftime('%B %d, %Y')} | "
-                           "Blueprint v1.1 | Not investment advice",
+                           "Blueprint v1.2 | Not investment advice",
                            ParagraphStyle('Footer', parent=styles['Normal'], fontSize=7,
                                          textColor=colors.HexColor('#999999'), alignment=TA_CENTER)))
     
@@ -3739,6 +3743,20 @@ if page == "📈 ETF Monitor":
         else:
             st.info("No emerging ETFs (<2 yrs) currently in the universe. New launches will appear here.")
 
+        # Track 3: Non-US listed / not covered by FMP
+        track3 = [r for r in etf_results if r.get('track') == 3]
+        if track3:
+            st.markdown("---")
+            st.subheader("⚪ NOT COVERED BY FMP — Track Manually")
+            df3 = pd.DataFrame([{
+                "Ticker": r['ticker'],
+                "Name": r.get('name',''),
+                "Status": r.get('tier',''),
+                "Action": r.get('note','')
+            } for r in track3])
+            st.dataframe(df3, use_container_width=True, hide_index=True)
+            st.caption("💡 These are non-US listings (Toronto/London/EU exchanges). FMP doesn't cover them — check prices directly on IBKR. ETHS & HIWO remain part of your strategy; MCIS just can't auto-score them.")
+
         st.markdown("---")
         st.caption("⏰ Quarterly reminder: Re-run this scan in Jan / Apr / Jul / Oct — or anytime on demand.")
 
@@ -3932,7 +3950,7 @@ if page == "🏛 Valuation Engine":
                       "Efficient scale — is the market only big enough for a few players?"]:
                 st.checkbox(q, key=f"moat_{vd['ticker']}_{q[:20]}")
 
-        st.caption("MCIS Valuation Engine | Blueprint v1.1 | Models, not predictions — not investment advice")
+        st.caption("MCIS Valuation Engine | Blueprint v1.2 | Models, not predictions — not investment advice")
     else:
         st.markdown('<div class="info-box">Enter a ticker and click <b>Load Company</b>. '
                     'The engine fetches 6 years of financials once, then every slider recalculates the DCF instantly.</div>',
