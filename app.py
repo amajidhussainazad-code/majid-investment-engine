@@ -1,5 +1,5 @@
 """
-MCIS Dashboard v1.1 — Majid Capital Investment System
+MCIS Dashboard v1.1.1 — Majid Capital Investment System
 Streamlit dynamic dashboard
 Deploy: streamlit run app.py
 v1.1: Currency-conversion fix — foreign-currency statements (DKK, TWD, RMB...)
@@ -406,6 +406,21 @@ def extract_metrics(d):
                 m["pe"] = round(price / eps, 1)
         except:
             pass
+
+    # ★ MCIS v1.1.1: recompute P/E in USD terms. FMP's P/E for foreign filers can
+    # mix the USD listing price with local-currency EPS (e.g. NVO: USD price / DKK
+    # EPS → P/E ~3 instead of ~14), which poisons every multiple-based fair value.
+    try:
+        _px = float(d.get("price", 0) or 0)
+        _inc0 = (d.get("income") or [{}])[0]
+        _eps_rep = float(_inc0.get("eps") or 0)
+        if _px > 0 and _eps_rep > 0:
+            _fx_eps = stmt_fx(d.get("income", []))
+            _pe_usd = _px / (_eps_rep * _fx_eps)
+            if 0 < _pe_usd < 500:
+                m["pe"] = round(_pe_usd, 1)
+    except Exception:
+        pass
 
     # EV/EBITDA
     v = ttm.get("evToEbitdaTTM") or ttm.get("enterpriseValueOverEBITDATTM")
