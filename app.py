@@ -1,7 +1,10 @@
 """
-MCIS Dashboard v1.0 — Majid Capital Investment System
+MCIS Dashboard v1.1 — Majid Capital Investment System
 Streamlit dynamic dashboard
 Deploy: streamlit run app.py
+v1.1: Currency-conversion fix — foreign-currency statements (DKK, TWD, RMB...)
+      are now converted to USD before every DCF / fair-value calculation,
+      and per-share scaling is ADR-immune (market-cap based).
 """
 
 import streamlit as st
@@ -178,6 +181,38 @@ def fmp_get(endpoint, params):
     except:
         return []
 
+# ═══════════════════════════════════════════════════════════════
+# ★ MCIS v1.1 CURRENCY FIX — FX helpers
+# FMP returns statements in each company's REPORTING currency
+# (DKK for NVO, TWD for TSM, RMB for PDD...). These helpers convert
+# every statement figure to USD BEFORE any DCF / fair value math.
+# ═══════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def get_fx_to_usd(currency):
+    """1 unit of `currency` in USD. Returns 1.0 for USD/unknown."""
+    if not currency or currency == "USD":
+        return 1.0
+    try:
+        q = fmp_get("quote", {"symbol": f"{currency}USD"})
+        if isinstance(q, list) and q and q[0].get("price"):
+            return float(q[0]["price"])
+        q = fmp_get("quote", {"symbol": f"USD{currency}"})
+        if isinstance(q, list) and q and q[0].get("price"):
+            return 1.0 / float(q[0]["price"])
+    except Exception:
+        pass
+    return 1.0
+
+def stmt_fx(statements):
+    """FX multiplier for a list of FMP statements (reads reportedCurrency of latest)."""
+    try:
+        if statements and isinstance(statements, list) and isinstance(statements[0], dict):
+            return get_fx_to_usd(statements[0].get("reportedCurrency", "USD"))
+    except Exception:
+        pass
+    return 1.0
+
 def fetch_company(ticker):
     d = {"ticker": ticker, "ok": False}
     try:
@@ -217,45 +252,59 @@ def fetch_company(ticker):
                 if ocf is not None and capex is not None:
                     fcf_val = float(ocf) - abs(float(capex))
                     if fcf_val > 0:
-                        d["fcf"] = fcf_val
+                        # ★ MCIS v1.1 FIX: convert reporting currency → USD
+                        d["fcf"] = fcf_val * stmt_fx(cf)
         except Exception as e:
             pass
-        
+
         try:
             # Shares Outstanding - try multiple sources
             shares = None
-            
+
             # Try TTM first
             ttm_data = d.get("ttm", {})
             if isinstance(ttm_data, dict):
                 shares = ttm_data.get("weightedAverageShsOut") or ttm_data.get("weightedAverageShsOutDil") or ttm_data.get("numberOfShares") or ttm_data.get("sharesOutstanding")
-            
+
             # Try metrics
             if not shares:
                 met = d.get("metrics", [])
                 if met and isinstance(met, list) and len(met) > 0 and isinstance(met[0], dict):
                     shares = met[0].get("weightedAverageShsOut") or met[0].get("weightedAverageShsOutDil") or met[0].get("numberOfShares") or met[0].get("sharesOutstanding")
-            
+
             # Try profile
             if not shares and d.get("profile"):
                 shares = d["profile"].get("shFloat") or d["profile"].get("sharesOutstanding") or d["profile"].get("sharesFloat")
-            
+
+            # ★ MCIS v1.1 FIX (ADR-immune): prefer shares implied by USD mktcap/price.
+            # For ADRs (e.g. TSM = 5 underlying shares) statement share counts do not
+            # match the US listing; mktcap/price always does.
+            try:
+                _px = float(d.get("price") or 0)
+                _mc = float(d.get("mktcap") or 0)
+                if _px > 0 and _mc > 0:
+                    shares = _mc / _px
+            except Exception:
+                pass
+
             if shares and shares > 0:
                 d["shares"] = float(shares)
         except Exception as e:
             pass
-        
+
         try:
             # Net Debt = Total Debt - Cash
             ttm = d.get("ttm", {})
             if isinstance(ttm, dict):
                 total_debt = ttm.get("totalDebt") or ttm.get("longTermDebt") or ttm.get("totalLiabilities", 0)
                 cash = ttm.get("cashAndCashEquivalents") or ttm.get("cash") or ttm.get("shortTermInvestments", 0)
-                
+
+                # ★ MCIS v1.1 FIX: convert reporting currency → USD
+                _fx_nd = stmt_fx(d.get("cashflow", []))
                 if total_debt and cash is not None:
-                    d["net_debt"] = float(total_debt) - float(cash)
+                    d["net_debt"] = (float(total_debt) - float(cash)) * _fx_nd
                 elif total_debt:
-                    d["net_debt"] = float(total_debt)
+                    d["net_debt"] = float(total_debt) * _fx_nd
         except Exception as e:
             pass
 
@@ -347,7 +396,7 @@ def extract_metrics(d):
     if "pe" not in m:
         v = ttm.get("peRatioTTM")
         if v: m["pe"] = round(float(v),1)
-    
+
     # Fallback: Calculate P/E from Price / EPS if not available
     if "pe" not in m and d.get("price") and d.get("income"):
         try:
@@ -812,8 +861,9 @@ def p3_full_valuation(ticker):
     try:
         if prof and isinstance(prof, list):
             price = prof[0].get('price', 0) or 0
-            mktcap = prof[0].get('mktCap', 0) or 0
+            mktcap = prof[0].get('mktCap', 0) or prof[0].get('marketCap', 0) or 0
             company_name = prof[0].get('companyName', ticker)
+            # ★ MCIS v1.1 FIX (ADR-immune): shares implied by USD mktcap / USD price
             if price > 0: shares = mktcap / price
     except: pass
     if shares <= 0:
@@ -830,6 +880,9 @@ def p3_full_valuation(ticker):
         if fcf0 <= 0 and len(recent_fcf) >= 2:
             fcf0 = sum(recent_fcf) / len(recent_fcf)
     except: pass
+
+    # ★ MCIS v1.1 FIX: convert reporting currency (DKK/TWD/RMB...) → USD
+    fcf0 = fcf0 * stmt_fx(cf)
 
     if fcf0 <= 0 or shares <= 0 or price <= 0:
         result['signal'] = "⚠️ DATA INSUFF"
@@ -866,13 +919,21 @@ def p3_full_valuation(ticker):
     result['intrinsic'] = intrinsic
     result['fair_value'] = fair_value
 
+    # ★ MCIS v1.1 SANITY BREAKER: model output wildly detached from price
+    # is almost always a data problem (currency, shares, stale FCF) — flag it.
+    result['review_flag'] = bool(price > 0 and (fair_value > 3 * price or fair_value < 0.2 * price))
+
     # Signal (25% margin of safety)
     buy_below = fair_value * 0.75
     result['buy_below'] = buy_below
     expected_return = (fair_value - price) / price * 100 if price > 0 else 0
     result['expected_return'] = expected_return
 
-    if price <= buy_below:
+    if result['review_flag']:
+        result['signal'] = "⚠️ DATA CHECK"
+        result['action'] = (f"Fair value ${fair_value:,.0f} vs price ${price:,.2f} — "
+                            "gap too large to trust. Verify currency/shares/FCF before acting.")
+    elif price <= buy_below:
         result['signal'] = "🟢 BUY"
         result['action'] = f"Strong buy — {expected_return:.0f}% upside to fair value"
     elif price <= fair_value:
@@ -902,7 +963,7 @@ CURRENT_HOLDINGS = ["SPUS", "ETHS"]
 # Foreign-listed halal ETFs: FMP suffix attempts + Yahoo symbols
 FOREIGN_ETF_MAP = {
     "ETHS": {"fmp_alts": ["ETHS.TO"], "yahoo": "ETHS.TO", "name": "iShares Global Halal (TSX)"},
-    "HIWO": {"fmp_alts": ["HIWO.L", "HIWO.MI"], "yahoo": "HIWO.L", "name": "iShares MSCI World Islamic (EU)"},
+    "HIWO": {"fmp_alts": ["HIWO.L", "HIWO.MI"], "yahoo": "HIWO.L", "name": "HSBC MSCI World Islamic ESG (LSE)"},
     "ISWD": {"fmp_alts": ["ISWD.L"], "yahoo": "ISWD.L", "name": "iShares MSCI World Islamic (LSE)"},
     "ISDW": {"fmp_alts": ["ISDW.L"], "yahoo": "ISDW.L", "name": "iShares MSCI World Islamic Dist (LSE)"},
     "WSHR": {"fmp_alts": ["WSHR.NE", "WSHR.TO"], "yahoo": "WSHR.NE", "name": "Wealthsimple Shariah World (TSX)"},
@@ -1213,24 +1274,24 @@ def calculate_blended_fair_value(r):
         "fcf_yield": 0.05,
         "graham": 0.05,
     }
-    
+
     price = float(r.get("price", 0) or 0)
     metrics = r.get("metrics", {})
-    
+
     if not price or price <= 0:
         return None
-    
+
     pe = float(metrics.get("pe", 0) or 0)
     rev_cagr = float(metrics.get("rev_cagr", 0) or 0)
     roic = float(metrics.get("roic", 0) or 0)
     gm = float(metrics.get("gm", 0) or 0)  # Gross margin as proxy for quality
-    
+
     try:
         # 1. REVERSE DCF (20%) - Conservative: assume fair value 5% above current
         valuations["reverse_dcf"] = price * 1.05
     except:
         pass
-    
+
     try:
         # 2. HISTORICAL MULTIPLES (15%) - P/E based
         if pe > 1 and pe < 100 and rev_cagr > 1:
@@ -1240,7 +1301,7 @@ def calculate_blended_fair_value(r):
             valuations["historical_multiples"] = fair_price
     except:
         pass
-    
+
     try:
         # 3. PETER LYNCH (10%) - Growth as fair P/E
         if pe > 1 and rev_cagr > 1:
@@ -1250,7 +1311,7 @@ def calculate_blended_fair_value(r):
             valuations["lynch"] = lynch_price
     except:
         pass
-    
+
     try:
         # 4. BUFFETT QUALITY PREMIUM (5%) - ROIC-based
         if roic > 15:  # Only if ROIC > 15% (Buffett threshold)
@@ -1260,7 +1321,7 @@ def calculate_blended_fair_value(r):
             valuations["buffett"] = buffett_price
     except:
         pass
-    
+
     try:
         # 5. FCF YIELD (5%) - Quality companies should trade at lower yield
         if gm > 35:  # Good gross margin = healthy FCF
@@ -1270,7 +1331,7 @@ def calculate_blended_fair_value(r):
             valuations["fcf_yield"] = fcf_yield_price
     except:
         pass
-    
+
     try:
         # 6. GRAHAM NUMBER (5%) - Fundamental safety margin
         # Simplified: Fair value = Price * sqrt(Quality Score)
@@ -1281,30 +1342,30 @@ def calculate_blended_fair_value(r):
             valuations["graham"] = graham_price
     except:
         pass
-    
+
     # Calculate weighted average
     if valuations:
         total_weight = sum([weights.get(k, 0) for k in valuations.keys()])
         if total_weight > 0:
             blended = sum([valuations[k] * weights.get(k, 0) for k in valuations.keys()]) / total_weight
             return blended if blended > price * 0.5 else price * 1.1  # Sanity check
-    
+
     return None
 
 def results_to_df(results):
     rows = []
     for r in results:
         m = r.get("metrics",{})
-        
+
         # Calculate Target Entry using blended valuation
         target_entry = "N/A"
         try:
             price = float(r.get("price", 0) or 0)
-            
+
             if price > 0:
                 # Use blended fair value calculation
                 fair_value = calculate_blended_fair_value(r)
-                
+
                 if fair_value and fair_value > 1:
                     # Target Entry = Fair Value with 30-50% margin of safety
                     target_bear = fair_value * 0.50  # 50% discount
@@ -1317,10 +1378,10 @@ def results_to_df(results):
                     target_entry = f"${target_bear:,.0f} - ${target_base:,.0f}"
         except:
             pass
-        
+
         # Store back into result dict so signal logic can use it (FIX for ⚠️ ANALYZE bug)
         r["target_entry"] = target_entry
-        
+
         # Compute signal here directly (single source of truth)
         try:
             price = float(r.get("price", 0) or 0)
@@ -1340,7 +1401,7 @@ def results_to_df(results):
                 r["signal"] = "⚠️ ANALYZE"
         except:
             r["signal"] = "⚠️ ANALYZE"
-        
+
         rows.append({
             "Ticker":    r["ticker"],
             "Company":   r["name"],
@@ -1378,10 +1439,10 @@ def fetch_historical_prices_yahoo(ticker, days=1825):
 def plot_5year_price_chart_yahoo(prices, ticker, current_price=None):
     """Create interactive 5-year price chart from Yahoo Finance data using Plotly."""
     import plotly.graph_objects as go
-    
+
     if not prices or len(prices) < 2:
         return None
-    
+
     # Handle both list of dicts and dict with summary stats
     if isinstance(prices, dict):
         # Summary stats only, no daily data
@@ -1398,46 +1459,46 @@ def plot_5year_price_chart_yahoo(prices, ticker, current_price=None):
         )
         fig.update_layout(height=300, template="plotly_white", margin=dict(l=50, r=50, t=50, b=50))
         return fig
-    
+
     # Has daily data
     dates = [p["date"] for p in prices]
     closes = [float(p["close"]) for p in prices]
     highs = [float(p.get("high", p["close"])) for p in prices]
     lows = [float(p.get("low", p["close"])) for p in prices]
-    
+
     closes_52w = closes[-252:] if len(closes) > 252 else closes
     high_52w = max(closes_52w) if closes_52w else max(closes)
     low_52w = min(closes_52w) if closes_52w else min(closes)
     high_5y = max(closes)
     low_5y = min(closes)
-    
+
     fig = go.Figure()
-    
+
     # Price line
     fig.add_trace(go.Scatter(
-        x=dates, y=closes, mode="lines", 
+        x=dates, y=closes, mode="lines",
         name="Close Price",
         line=dict(color="#1a3c5e", width=2),
         hovertemplate="<b>%{x}</b><br>Close: $%{y:,.2f}<extra></extra>"
     ))
-    
+
     # 52-week range
     fig.add_hline(y=high_52w, line_dash="dash", line_color="#e65100", line_width=1,
                  annotation_text=f"52W High: ${high_52w:,.0f}", annotation_position="right")
     fig.add_hline(y=low_52w, line_dash="dash", line_color="#e65100", line_width=1,
                  annotation_text=f"52W Low: ${low_52w:,.0f}", annotation_position="right")
-    
+
     # Current price
     if current_price:
         fig.add_hline(y=current_price, line_dash="solid", line_color="#1b5e20", line_width=3,
                      annotation_text=f"Current: ${current_price:,.2f}", annotation_position="right")
-    
+
     fig.update_layout(
         title=f"{ticker} — 5-Year Price History | High: ${high_5y:,.0f} | Low: ${low_5y:,.0f}",
         xaxis_title="Date", yaxis_title="Close Price ($)",
         hovermode="x unified", height=380, template="plotly_white",
         margin=dict(l=50, r=120, t=60, b=50))
-    
+
     return fig
 
 def validate_financial_data(d, result):
@@ -1445,7 +1506,7 @@ def validate_financial_data(d, result):
     m = result.get("metrics", {})
     flags = []
     quality = "🟢 VALIDATED"
-    
+
     gm = m.get("gm")
     if gm is not None:
         if gm > 90:
@@ -1454,7 +1515,7 @@ def validate_financial_data(d, result):
         elif gm < 0:
             flags.append(f"🔴 Gross margin {gm}% is negative — data error or distressed")
             quality = "🔴 REQUIRES REVIEW"
-    
+
     inc = d.get("income", []) or []
     if inc and inc[0].get("revenue"):
         nm = (float(inc[0].get("netIncome") or 0) / float(inc[0]["revenue"])) * 100
@@ -1464,7 +1525,7 @@ def validate_financial_data(d, result):
         elif nm < -50:
             flags.append(f"🔴 Net margin {nm:.1f}% — deeply unprofitable")
             quality = "🔴 REQUIRES REVIEW"
-    
+
     revs = [float(yr.get("revenue") or 0) for yr in inc[:4] if yr.get("revenue")]
     if len(revs) >= 2:
         yoy_growth = ((revs[0] / revs[-1]) - 1) * 100
@@ -1474,7 +1535,7 @@ def validate_financial_data(d, result):
         elif yoy_growth < -50:
             flags.append(f"🔴 Revenue down {yoy_growth:.0f}% YoY — significant contraction")
             quality = "🔴 REQUIRES REVIEW"
-    
+
     de = m.get("debt_ebitda")
     if de is not None:
         if de > 8:
@@ -1483,7 +1544,7 @@ def validate_financial_data(d, result):
         elif de > 5:
             flags.append(f"⚠️ Debt/EBITDA {de:.1f}x — elevated leverage")
             quality = "🟡 CAUTION"
-    
+
     return {"quality_badge": quality, "flags": flags}
 
 @st.cache_data(ttl=86400)
@@ -1496,21 +1557,21 @@ def audit_fmp_vs_yahoo(ticker):
         fmp_data = fetch_company(ticker)
         if not fmp_data.get("ok"):
             return audit
-        
+
         # Yahoo Finance data
         yf_url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,incomeStatementHistory"
         yf_resp = requests.get(yf_url, timeout=15)
         yf_data = yf_resp.json()
-        
+
         if "quoteSummary" not in yf_data or not yf_data["quoteSummary"].get("result"):
             return audit
-        
+
         yf = yf_data["quoteSummary"]["result"][0]
-        
+
         # Compare revenue (most recent year)
         fmp_rev = fmp_data.get("income", [])
         yf_rev = yf.get("incomeStatementHistory", {}).get("incomeStatementHistory", [])
-        
+
         if fmp_rev and yf_rev:
             fmp_val = float(fmp_rev[0].get("revenue") or 0)
             yf_val = float(yf_rev[0].get("totalRevenue", {}).get("raw") or 0)
@@ -1519,7 +1580,7 @@ def audit_fmp_vs_yahoo(ticker):
                 audit["matches"]["revenue"] = f"FMP ${fmp_val/1e9:.1f}B vs Yahoo ${yf_val/1e9:.1f}B (diff: {pct_diff:.1f}%)"
                 if pct_diff > 5:
                     audit["discrepancies"].append(f"Revenue mismatch {pct_diff:.1f}%")
-        
+
         # Compare price
         fmp_price = fmp_data.get("price", 0)
         yf_price = yf.get("financialData", {}).get("currentPrice", {}).get("raw", 0)
@@ -1528,11 +1589,11 @@ def audit_fmp_vs_yahoo(ticker):
             audit["matches"]["price"] = f"FMP ${fmp_price:,.2f} vs Yahoo ${yf_price:,.2f} (diff: {pct_diff:.1f}%)"
             if pct_diff > 2:
                 audit["discrepancies"].append(f"Price mismatch {pct_diff:.1f}%")
-        
+
         audit["status"] = "✅ MATCH" if not audit["discrepancies"] else "⚠️ REVIEW"
     except Exception as e:
         audit["error"] = str(e)
-    
+
     return audit
 
 # ═════════════════════════════════════════════
@@ -1540,38 +1601,58 @@ def audit_fmp_vs_yahoo(ticker):
 # ═════════════════════════════════════════════
 
 def _val_inputs(d):
-    """Extract the raw numbers the valuation engine needs."""
+    """Extract the raw numbers the valuation engine needs.
+    ★ MCIS v1.1: all statement figures converted to USD; shares are ADR-immune."""
     v = {}
     q   = d.get("quote", {})
     bal = d.get("balance", []) or []
     cf  = d.get("cashflow6", []) or []
     inc = d.get("income6", []) or []
+
+    # ★ MCIS v1.1 FIX: FX multiplier from the statements' reported currency
+    fx = stmt_fx(cf) if cf else stmt_fx(inc)
+
     v["price"]  = float(q.get("price") or d.get("price") or 0)
-    v["shares"] = float(q.get("sharesOutstanding") or 0)
-    if not v["shares"] and v["price"] and d.get("mktcap"):
-        v["shares"] = d["mktcap"] / v["price"]
     v["mktcap"] = float(q.get("marketCap") or d.get("mktcap") or 0)
+
+    # ★ MCIS v1.1 FIX (ADR-immune): shares implied by USD mktcap / USD price first
+    v["shares"] = 0
+    if v["price"] and v["mktcap"]:
+        v["shares"] = v["mktcap"] / v["price"]
+    if not v["shares"]:
+        v["shares"] = float(q.get("sharesOutstanding") or 0)
+
     b0 = bal[0] if bal else {}
     cash = float(b0.get("cashAndShortTermInvestments") or b0.get("cashAndCashEquivalents") or 0)
     debt = float(b0.get("totalDebt") or 0)
-    v["net_debt"] = debt - cash
-    fcf_hist = [float(y["freeCashFlow"]) for y in reversed(cf) if y.get("freeCashFlow") is not None]
+    # ★ MCIS v1.1 FIX: net debt converted to USD
+    v["net_debt"] = (debt - cash) * fx
+
+    # ★ MCIS v1.1 FIX: FCF history converted to USD
+    fcf_hist = [float(y["freeCashFlow"]) * fx for y in reversed(cf) if y.get("freeCashFlow") is not None]
     v["fcf_hist"] = fcf_hist
     ttm = d.get("ttm", {}) or {}
-    v["fcf0"] = float(ttm.get("freeCashFlowTTM") or (fcf_hist[-1] if fcf_hist else 0))
+    # ★ MCIS v1.1 FIX: TTM FCF converted to USD (same reporting currency as statements)
+    _fcf_ttm = ttm.get("freeCashFlowTTM")
+    if _fcf_ttm:
+        v["fcf0"] = float(_fcf_ttm) * fx
+    else:
+        v["fcf0"] = fcf_hist[-1] if fcf_hist else 0
     if not v["fcf0"] and fcf_hist: v["fcf0"] = fcf_hist[-1]
     def cagr(series):
         s = [x for x in series if x and x > 0]
         if len(s) >= 3: return (s[-1]/s[0])**(1/(len(s)-1)) - 1
         return None
     v["fcf_cagr"] = cagr(fcf_hist)
-    revs = [float(y["revenue"]) for y in reversed(inc) if y.get("revenue")]
+    # ★ MCIS v1.1 FIX: revenue history converted to USD (growth rates unaffected,
+    # but FCF-margin style ratios elsewhere stay consistent)
+    revs = [float(y["revenue"]) * fx for y in reversed(inc) if y.get("revenue")]
     v["rev_hist"] = revs
     v["rev_cagr"] = cagr(revs)
     eps  = [float(y["eps"]) for y in reversed(inc) if y.get("eps") is not None]
     v["eps_hist"] = eps
     v["eps_cagr"] = cagr([e for e in eps if e > 0]) if any(e > 0 for e in eps) else None
-    v["ni_hist"]  = [float(y.get("netIncome") or 0) for y in reversed(inc)]
+    v["ni_hist"]  = [float(y.get("netIncome") or 0) * fx for y in reversed(inc)]
     v["shares_hist"] = [float(y.get("weightedAverageShsOutDil") or y.get("weightedAverageShsOut") or 0)
                         for y in reversed(inc)]
     return v
@@ -1784,12 +1865,12 @@ if page == "🏠 Dashboard":
         # 🟢 READY TO BUY NOW — ACTION ITEMS
         # ═══════════════════════════════════════════════════════════
         st.markdown('<div class="section-header">🟢 READY TO BUY NOW — Action Items</div>', unsafe_allow_html=True)
-        
+
         # Populate target_entry + signal for ALL results (t1+t2+t3) before any logic
         _ = results_to_df(results)  # side effect: sets r["target_entry"] and r["signal"]
-        
+
         buy_now = [r for r in t1 if r.get("signal") == "🟢 BUY"]
-        
+
         if buy_now:
             st.markdown(f"**🎯 {len(buy_now)} companies ready to buy** — within Target Entry range, excellent opportunities!")
             df_buy = results_to_df(sorted(buy_now, key=lambda x: x["score"], reverse=True))
@@ -1798,7 +1879,7 @@ if page == "🏠 Dashboard":
             st.caption("✅ These are your immediate buy candidates. Add to portfolio when capital available.")
         else:
             st.info("⏳ No Tier 1 companies at buy prices right now. Check back after market corrections!")
-        
+
         st.markdown("---")
 
         # Capital allocation
@@ -1813,10 +1894,10 @@ if page == "🏠 Dashboard":
 
         # ETF ANALYSIS: 5-YEAR PRICE RANGES
         st.markdown('<div class="section-header">💎 Halal ETF Core — 5-Year Price Analysis</div>', unsafe_allow_html=True)
-        
+
         etf_list = ["SPUS", "SPTE", "SPWO"]
         etf_data = []
-        
+
         for ticker in etf_list:
             etf_info = analyze_etf_prices(ticker)
             if etf_info:
@@ -1825,14 +1906,14 @@ if page == "🏠 Dashboard":
                 low = etf_info["low"]
                 target = etf_info["target"]
                 status = etf_info.get("status", "✅ Data")
-                
+
                 if current <= target:
                     signal = "🟢 BUY"
                 elif current <= (high + low) / 2:
                     signal = "🟡 WAIT"
                 else:
                     signal = "🔴 HOLD"
-                
+
                 etf_data.append({
                     "ETF": ticker,
                     "Current": f"${current:.2f}",
@@ -1841,51 +1922,51 @@ if page == "🏠 Dashboard":
                     "Target": f"${target:.2f}",
                     "Signal": signal,
                 })
-        
+
         if etf_data:
             st.dataframe(pd.DataFrame(etf_data), use_container_width=True, hide_index=True)
             st.caption("💡 Buy at Target price (5-year low with safety margin). Hold until 5-year high.")
         else:
             st.warning("⚠️ ETF data unavailable. Please try again in a moment.")
-        
+
         st.markdown("---")
 
         # 🏆 ALL TIER 1 COMPANIES WITH SIGNALS
         st.markdown('<div class="section-header">🏆 All Tier 1 Companies — With Signals</div>', unsafe_allow_html=True)
-        
+
         if t1:
             # Signals already computed by results_to_df(results) above
-            
+
             # PHASE 1: PILL BUTTON FILTER
             # Initialize session state for signal filter
             if 'selected_signal_tier1' not in st.session_state:
                 st.session_state.selected_signal_tier1 = 'All'
-            
+
             # Create pill button filter
             st.markdown("#### 🔍 Filter by Signal")
             col1, col2, col3, col4 = st.columns(4)
-            
+
             with col1:
                 if st.button('All', key='btn_all_tier1', use_container_width=True):
                     st.session_state.selected_signal_tier1 = 'All'
-            
+
             with col2:
                 if st.button('🟢 Buy', key='btn_buy_tier1', use_container_width=True):
                     st.session_state.selected_signal_tier1 = '🟢 BUY'
-            
+
             with col3:
                 if st.button('🟡 Wait', key='btn_wait_tier1', use_container_width=True):
                     st.session_state.selected_signal_tier1 = '🟡 WAIT'
-            
+
             with col4:
                 if st.button('🔴 Avoid', key='btn_avoid_tier1', use_container_width=True):
                     st.session_state.selected_signal_tier1 = '🔴 AVOID'
-            
+
             st.markdown("---")
-            
+
             # Get sorted list
             sorted_t1 = sorted(t1, key=lambda x: x["score"], reverse=True)[:15]
-            
+
             # Filter based on selected signal
             if st.session_state.selected_signal_tier1 == 'All':
                 filtered_t1 = sorted_t1
@@ -1893,18 +1974,18 @@ if page == "🏠 Dashboard":
             else:
                 filtered_t1 = [r for r in sorted_t1 if r.get("signal") == st.session_state.selected_signal_tier1]
                 st.info(f"📊 Showing: {len(filtered_t1)} companies with signal '{st.session_state.selected_signal_tier1}'")
-            
+
             # Display filtered dataframe
             if filtered_t1:
                 df_t1 = results_to_df(filtered_t1)
                 df_t1["Signal"] = [r.get("signal", "⚠️ ANALYZE") for r in filtered_t1]
-                
+
                 st.dataframe(df_t1[["Ticker","Company","Score","ROIC%","GM%","RevCAGR%","Price","Target Entry","Signal","Halal"]],
                             use_container_width=True, hide_index=True)
                 st.caption("📊 Tier 1 companies with investment signals. Load in Valuation Engine for detailed analysis.")
             else:
                 st.warning(f"No Tier 1 companies found with signal '{st.session_state.selected_signal_tier1}'")
-            
+
         else:
             st.info("No Tier 1 results yet. Run the scanner first.")
 
@@ -1935,7 +2016,7 @@ if page == "🏠 Dashboard":
 
         # Fair Value Opportunities Snapshot
         st.markdown('<div class="section-header">💎 Fair Value Opportunities — Quick Glance</div>', unsafe_allow_html=True)
-        
+
         fv_opps = []
         for r in sorted(t1 + t2, key=lambda x: x["score"], reverse=True)[:15]:  # Top 15 by score
             try:
@@ -1945,7 +2026,7 @@ if page == "🏠 Dashboard":
                 net_debt = float(r.get("net_debt", 0) or 0)
                 m = r.get("metrics", {})
                 rev_cagr = float(m.get("rev_cagr", 0) or 0) / 100
-                
+
                 if price > 0 and fcf > 100000 and shares > 0 and rev_cagr > 0:
                     wacc, tg = 0.08, 0.025
                     g1 = min(max(rev_cagr, 0.04), 0.25)
@@ -1953,23 +2034,26 @@ if page == "🏠 Dashboard":
                     fcf_yr5 = fcf * ((1 + g1) ** 5)
                     tv = (fcf_yr5 * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
                     fv_ps = ((pv_s1 + tv) - net_debt) / shares
-                    
+
                     if fv_ps > 1:
                         discount = ((fv_ps - price) / price) * 100
+                        # ★ MCIS v1.1 SANITY BREAKER: flag detached values instead of showing them
+                        flag = "⚠️ DATA CHECK" if (fv_ps > 3*price or fv_ps < 0.2*price) else ""
                         fv_opps.append({
                             "Ticker": r["ticker"],
                             "Current Price": f"${price:,.2f}",
                             "Fair Value": f"${fv_ps:,.2f}",
                             "Discount": f"{discount:+.0f}%",
                             "Tier": r.get("verdict", ""),
+                            "Flag": flag,
                         })
             except:
                 pass
-        
+
         if fv_opps:
             fv_df = pd.DataFrame(fv_opps).sort_values("Discount", ascending=False)
             st.dataframe(fv_df, use_container_width=True, hide_index=True)
-            st.caption("💡 Positive discount = undervalued (buy). Negative = overvalued (avoid)")
+            st.caption("💡 Positive discount = undervalued (buy). Negative = overvalued (avoid). ⚠️ DATA CHECK = number too detached from price — verify before trusting.")
         else:
             st.info("Fair Value data will appear here after full company analysis. Go to 📄 Company Dossier for detailed calculations.")
 
@@ -2047,7 +2131,7 @@ elif page == "🔍 Scanner":
                     errors += 1
                     continue
                 result = run_filters(data)
-                
+
                 # Pass through FCF/shares/net_debt from fetch_company to result
                 if data.get("fcf"):
                     result["fcf"] = data["fcf"]
@@ -2160,7 +2244,7 @@ elif page == "🔎 Company Lookup":
 
     # Get available tickers from scan results
     available_tickers = sorted(set([r["ticker"] for r in st.session_state.scan_results]))
-    
+
     col1, col2 = st.columns([2, 1])
     with col1:
         if available_tickers:
@@ -2175,7 +2259,7 @@ elif page == "🔎 Company Lookup":
         else:
             ticker_input = st.text_input("Enter ticker symbol", placeholder="e.g. NVDA").upper().strip()
             st.caption("💡 Run the Scanner first to populate the dropdown")
-    
+
     with col2:
         st.empty()  # Spacer
 
@@ -2227,7 +2311,7 @@ elif page == "🔎 Company Lookup":
             st.markdown('<div class="section-header">📈 5-Year Price History</div>', unsafe_allow_html=True)
             with st.spinner(f"Fetching price data for {ticker_input}..."):
                 prices = fetch_historical_prices_yahoo(ticker_input)
-            
+
             if prices and len(prices) > 10:
                 fig = plot_5year_price_chart_yahoo(prices, ticker_input, data.get("price"))
                 if fig:
@@ -2242,9 +2326,9 @@ elif page == "🔎 Company Lookup":
                     - Endpoint not available on your current FMP plan (verify in FMP dashboard)
                     - API key needs to fully activate (wait 15 minutes)
                     - Ticker symbol issue (verify ticker exists)
-                    
+
                     **Current price from FMP:** $""" + str(data.get('price', 'N/A')) + """
-                    
+
                     Check: Go to FMP dashboard → test historical-price-eod/light endpoint manually
                     """)
                 st.info(f"Current price from FMP: ${data.get('price', 'N/A')}")
@@ -2308,6 +2392,9 @@ elif page == "📋 Watchlist":
                     try:
                         range_str = target_entry.replace("$", "").replace(",", "")
                         low, high = [float(x.strip()) for x in range_str.split("-")]
+                        # ★ MCIS v1.1 SANITY GUARD: skip rows whose target is detached from price
+                        if high > price * 3 or high < price * 0.25:
+                            continue
                         # If current price is within or below target entry range = BUY
                         if price <= high:
                             r["buy_signal"] = f"🟢 BUY at ${price:,.2f}"
@@ -2320,16 +2407,16 @@ elif page == "📋 Watchlist":
     if auto_buy_candidates:
         st.markdown('<div class="section-header">🟢 Auto-Buy Candidates — Tier 1 at Target Entry</div>', unsafe_allow_html=True)
         st.markdown(f"**{len(auto_buy_candidates)} companies ready to buy** (within Target Entry range)")
-        
+
         df_auto = results_to_df(auto_buy_candidates)
         st.dataframe(df_auto[["Ticker","Company","Score","Tier","ROIC%","GM%","Price","Target Entry","Halal"]],
                     use_container_width=True, hide_index=True)
-        
+
         st.caption("💡 These Tier 1 companies are at or below your Target Entry price. Perfect entry points.")
 
     # MANUAL ADDITIONS
     st.markdown('<div class="section-header">➕ Manual Watchlist</div>', unsafe_allow_html=True)
-    
+
     # Add manually
     col1,col2 = st.columns([3,1])
     with col1:
@@ -2613,8 +2700,8 @@ def _tbl_rows(d, keys, years=5):
     while len(h) < years: h.insert(0, {})
     return h
 
-def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, lynch_cat, 
-                         lynch_note, lynch_peg, moat_rating, moat_score, 
+def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, lynch_cat,
+                         lynch_note, lynch_peg, moat_rating, moat_score,
                          cio_recommendation, investment_edge, risks_text):
     """Generate a professional 2-page MCIS Company Dossier PDF."""
     from reportlab.lib.pagesizes import letter
@@ -2624,13 +2711,13 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
     from datetime import datetime
-    
+
     output_path = f"/tmp/{ticker}_dossier.pdf"
     doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch,
                             leftMargin=0.6*inch, rightMargin=0.6*inch)
     story = []
     styles = getSampleStyleSheet()
-    
+
     # Custom styles
     t_header = ParagraphStyle('CustomHeader', parent=styles['Heading1'],
                               fontSize=16, textColor=colors.HexColor('#1a3c5e'),
@@ -2642,27 +2729,27 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
                               fontSize=9, alignment=TA_LEFT, spaceAfter=3)
     t_small  = ParagraphStyle('CustomSmall', parent=styles['Normal'],
                               fontSize=8, textColor=colors.HexColor('#666666'), spaceAfter=2)
-    
+
     # ═══════════════════════════════════════════
     # PAGE 1 — FINANCIAL SNAPSHOT
     # ═══════════════════════════════════════════
-    
+
     # Header
     story.append(Paragraph(f"<b>{ticker} — {d.get('name','')}</b>", t_header))
     story.append(Paragraph(f"{d.get('sector','')} | {d.get('industry','')} | "
                            f"Price ${v['price']:,.2f} | Market Cap {fmt_mktcap(v['mktcap'])}",
                            t_small))
     story.append(Spacer(1, 0.15*inch))
-    
+
     # 1. Income Statement (5 years) — CURRENT YEAR AND 4 PRIOR YEARS
     from datetime import datetime
     current_year = datetime.now().year
     years_header = [str(current_year - 4 + i) for i in range(5)]  # e.g., 2022, 2023, 2024, 2025, 2026
-    
+
     story.append(Paragraph("INCOME STATEMENT (5 YEARS)", t_subhdr))
     inc = _tbl_rows(d, ['income6', 'income'], years=5)
     inc_rows = [["Metric"] + years_header]
-    
+
     for label, key, fmt_fn in [
         ("Revenue", "revenue", lambda x: _format_number(x)),
         ("Revenue Growth %", "__rev_cagr__", lambda x: "—"),
@@ -2712,7 +2799,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
                 val = yr.get(key)
                 row.append(fmt_fn(val) if val else "—")
         inc_rows.append(row)
-    
+
     inc_tbl = Table(inc_rows, colWidths=[1.3*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch])
     inc_tbl.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
@@ -2729,7 +2816,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     ]))
     story.append(inc_tbl)
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 2. Cash Flow Statement (5 years)
     story.append(Paragraph("CASH FLOW STATEMENT (5 YEARS)", t_subhdr))
     cf = _tbl_rows(d, ['cashflow6', 'cashflow'], years=5)
@@ -2751,7 +2838,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
                 val = yr.get(key)
                 row.append(_format_number(val) if val else "—")
         cf_rows.append(row)
-    
+
     cf_tbl = Table(cf_rows, colWidths=[1.3*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch, 0.95*inch])
     cf_tbl.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
@@ -2767,7 +2854,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     ]))
     story.append(cf_tbl)
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 3. Balance Sheet (5 years)
     story.append(Paragraph("BALANCE SHEET & CAPITAL STRUCTURE (5 YEARS)", t_subhdr))
     bal = _tbl_rows(d, ['balance'], years=5)
@@ -2790,7 +2877,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
                 val = yr.get(key)
                 row.append(_format_number(val) if val else "—")
         bal_rows.append(row)
-    
+
     bal_tbl = Table(bal_rows, colWidths=[1.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch])
     bal_tbl.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a3c5e')),
@@ -2806,7 +2893,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     ]))
     story.append(bal_tbl)
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 4. Key Ratios
     story.append(Paragraph("KEY FINANCIAL RATIOS", t_subhdr))
     m = result.get("metrics", {})
@@ -2831,10 +2918,10 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     ]))
     story.append(ratio_tbl)
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 5. Price Section
     story.append(Paragraph("PRICE & VALUATION METRICS", t_subhdr))
-    
+
     # Calculate Fair Value (DCF base case)
     fv_per_share = "N/A"
     margin_of_safety = "N/A"
@@ -2846,7 +2933,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
             wacc = 0.08
             tg = 0.025
             g1 = min(max(v.get("rev_cagr", 0.10), 0.04), 0.25)
-            
+
             # 2-stage DCF
             pv_stage1 = sum([fcf0 * ((1 + g1) ** yr) / ((1 + wacc) ** yr) for yr in range(1, 6)])
             fcf_year5 = fcf0 * ((1 + g1) ** 5)
@@ -2855,14 +2942,14 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
             total_pv = pv_stage1 + tv
             equity_value = total_pv - v.get("net_debt", 0)
             fv_ps = equity_value / shares if shares > 0 else 0
-            
+
             if fv_ps > 0:
                 fv_per_share = f"${fv_ps:,.2f}"
                 mos = ((fv_ps - price) / price) * 100 if price > 0 else 0
                 margin_of_safety = f"{mos:+.1f}%"
     except:
         pass
-    
+
     price_info = [
         ["Current Price", f"${v['price']:,.2f}"],
         ["Fair Value (DCF)", fv_per_share],
@@ -2883,17 +2970,17 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
         ('TOPPADDING', (0, 0), (-1, -1), 3),
     ]))
     story.append(price_tbl)
-    
+
     # Page break
     story.append(PageBreak())
-    
+
     # ═══════════════════════════════════════════
     # PAGE 2 — INVESTMENT ANALYSIS (CIO PAGE)
     # ═══════════════════════════════════════════
-    
+
     story.append(Paragraph(f"<b>INVESTMENT ANALYSIS — {ticker}</b>", t_header))
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 1. Valuation
     story.append(Paragraph("VALUATION FRAMEWORK", t_subhdr))
     val_data = [
@@ -2916,7 +3003,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     ]))
     story.append(val_tbl)
     story.append(Spacer(1, 0.1*inch))
-    
+
     # 2. Buffett Quality Test
     story.append(Paragraph("BUFFETT QUALITY TEST (10 CHECKS)", t_subhdr))
     story.append(Paragraph(f"<b>Score: {buffett_score}/10</b> | " +
@@ -2928,18 +3015,18 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
         symbol = "✓" if c["ok"] else "✗"
         story.append(Paragraph(f"<b>{symbol} {c['check']}</b> — {c['detail']}", t_small))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 3. Peter Lynch Classification
     story.append(Paragraph("PETER LYNCH CLASSIFICATION", t_subhdr))
     story.append(Paragraph(f"<b>{lynch_cat}</b>", t_normal))
     story.append(Paragraph(lynch_note, t_small))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 4. Moat Assessment
     story.append(Paragraph("COMPETITIVE MOAT", t_subhdr))
     story.append(Paragraph(f"<b>{moat_rating} ({moat_score}/10)</b>", t_normal))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 5. Risks (from input)
     story.append(Paragraph("MATERIAL RISKS", t_subhdr))
     if risks_text:
@@ -2949,7 +3036,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     else:
         story.append(Paragraph("• No risks documented", t_small))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 6. Investment Edge
     story.append(Paragraph("INVESTMENT EDGE", t_subhdr))
     if investment_edge:
@@ -2957,7 +3044,7 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     else:
         story.append(Paragraph("[Investment edge not yet documented]", t_small))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 7. CIO Recommendation
     story.append(Paragraph("CIO RECOMMENDATION", t_subhdr))
     rec_color = colors.HexColor('#1b5e20') if cio_recommendation == "BUY" else \
@@ -2966,18 +3053,18 @@ def generate_dossier_pdf(ticker, d, v, result, buffett_checks, buffett_score, ly
     story.append(Paragraph(f"<font color='#{'1b5e20' if cio_recommendation == 'BUY' else '006064' if cio_recommendation == 'HOLD' else 'e65100' if cio_recommendation == 'WATCH' else 'b71c1c'}'><b>{cio_recommendation}</b></font>",
                            t_normal))
     story.append(Spacer(1, 0.08*inch))
-    
+
     # 8. Capital Allocation
     story.append(Paragraph("PORTFOLIO ALLOCATION", t_subhdr))
     story.append(Paragraph("[To be determined by CIO based on position sizing framework]", t_small))
     story.append(Spacer(1, 0.15*inch))
-    
+
     # Footer
     story.append(Paragraph(f"MCIS Company Dossier | Generated {datetime.now().strftime('%B %d, %Y')} | "
                            "Blueprint v1.2 | Not investment advice",
                            ParagraphStyle('Footer', parent=styles['Normal'], fontSize=7,
                                          textColor=colors.HexColor('#999999'), alignment=TA_CENTER)))
-    
+
     doc.build(story)
     return output_path
 
@@ -3017,11 +3104,11 @@ if page == "📄 Company Dossier":
         pe = m.get("pe")
 
         st.subheader(f"{vd['ticker']} — {vd.get('name','')}")
-        
+
         # ═══════════════════════════════════════════
         # AUTOMATIC BUY/HOLD/AVOID SIGNAL
         # ═══════════════════════════════════════════
-        
+
         # Calculate base case fair value
         fcf0 = v.get("fcf0", 0)
         shares = v.get("shares", 0)
@@ -3031,11 +3118,11 @@ if page == "📄 Company Dossier":
         tg = 0.025
         g1_base = min(max(v.get("rev_cagr", 0.10), 0.04), 0.25)
         mos_req = 50  # Default 50% margin of safety requirement
-        
+
         auto_signal = "⚠️ ANALYZE"
         signal_color = "#FFA500"  # Orange
         signal_detail = "Insufficient data for automatic signal"
-        
+
         if fcf0 > 0 and shares > 0 and price > 0:
             try:
                 # DCF calculation
@@ -3044,9 +3131,15 @@ if page == "📄 Company Dossier":
                 tv = (fcf_yr5 * (1 + tg) / (wacc - tg)) / ((1 + wacc) ** 5)
                 fv_ps = ((pv_s1 + tv) - net_debt) / shares if shares > 0 else 0
                 discount = ((fv_ps - price) / price) * 100 if price > 0 else 0
-                
+
                 if fv_ps > 0:
-                    if discount >= mos_req:
+                    # ★ MCIS v1.1 SANITY BREAKER: detached FV = data problem, not signal
+                    if fv_ps > 3 * price or fv_ps < 0.2 * price:
+                        auto_signal = "⚠️ DATA CHECK"
+                        signal_color = "#FFA500"
+                        signal_detail = (f"FV ${fv_ps:,.0f} vs Price ${price:,.2f} — gap too large to trust. "
+                                         "Verify currency/shares/FCF before acting.")
+                    elif discount >= mos_req:
                         auto_signal = "🟢 BUY"
                         signal_color = "#1b5e20"
                         signal_detail = f"Undervalued by {discount:.0f}% (FV: ${fv_ps:,.0f} vs Price: ${price:,.2f})"
@@ -3060,10 +3153,10 @@ if page == "📄 Company Dossier":
                         signal_detail = f"Overvalued by {abs(discount):.0f}% (FV: ${fv_ps:,.0f} vs Price: ${price:,.2f})"
             except:
                 pass
-        
+
         # Display signal prominently - SIMPLE VERSION
         col1, col2, col3 = st.columns([2, 2, 2])
-        
+
         with col1:
             if auto_signal == "🔴 AVOID":
                 st.error(f"**{auto_signal}**\n{signal_detail}")
@@ -3073,10 +3166,10 @@ if page == "📄 Company Dossier":
                 st.warning(f"**{auto_signal}**\n{signal_detail}")
             else:
                 st.info(f"**{auto_signal}**\n{signal_detail}")
-        
+
         with col2:
             st.metric("Current Price", f"${price:,.2f}")
-        
+
         with col3:
             if fcf0 > 0 and shares > 0 and price > 0:
                 try:
@@ -3089,7 +3182,7 @@ if page == "📄 Company Dossier":
                     st.metric("Fair Value", "N/A")
             else:
                 st.metric("Fair Value", "N/A")
-        
+
         st.markdown("---")
         # Valuation + quality outputs (for later use in form)
         checks, buff_score, mx = buffett_test(vd, v)
@@ -3098,7 +3191,7 @@ if page == "📄 Company Dossier":
 
         # ── Form inputs for CIO section ──
         st.markdown('<div class="section-header">⚙️ Complete the investment thesis</div>', unsafe_allow_html=True)
-        
+
         c1, c2 = st.columns(2)
         with c1:
             cio_rec = st.radio("CIO Recommendation", ["BUY", "HOLD", "WATCH", "AVOID"], horizontal=True, key="cio_rec")
@@ -3164,6 +3257,8 @@ if page == "📄 Company Dossier":
                     st.success(f"## {sig} — {p3.get('action','')}")
                 elif "HOLD" in sig:
                     st.info(f"## {sig} — {p3.get('action','')}")
+                elif "DATA CHECK" in sig:
+                    st.warning(f"## {sig} — {p3.get('action','')}")
                 else:
                     st.error(f"## {sig} — {p3.get('action','')}")
 
@@ -3226,36 +3321,40 @@ if page == "📄 Company Dossier":
 
                 st.caption("💡 BUY when price ≤ target entry | Legend in sidebar 📖")
 
-        
+
         st.markdown("---")
         st.markdown('<div class="section-header">📊 Financial Statements — 5-Year History</div>', unsafe_allow_html=True)
-        
+
         # Fetch real financial data from FMP API
         try:
             # Fetch Income Statement
             income_stmt = fmp_get("income-statement", {"symbol": dos_ticker, "limit": 5})
-            
+
             # Fetch Cash Flow Statement
             cashflow_stmt = fmp_get("cash-flow-statement", {"symbol": dos_ticker, "limit": 5})
-            
+
             # Fetch Balance Sheet
             balance_sheet = fmp_get("balance-sheet-statement", {"symbol": dos_ticker, "limit": 5})
-            
+
             # ═══════════════════════════════════════════════════════════════════════════════
             # TABLE 1: INCOME STATEMENT (5 YEARS)
             # ═══════════════════════════════════════════════════════════════════════════════
-            
+
             if income_stmt and isinstance(income_stmt, list) and len(income_stmt) > 0:
                 st.subheader("📈 Income Statement (5 Years)")
-                
+                # ★ MCIS v1.1: show reporting currency so foreign statements aren't misread as USD
+                _rep_ccy = income_stmt[0].get("reportedCurrency", "USD") if isinstance(income_stmt[0], dict) else "USD"
+                if _rep_ccy != "USD":
+                    st.caption(f"⚠️ Statements reported in **{_rep_ccy}** (converted to USD only inside valuation engines; tables below show reported figures)")
+
                 # Build income statement dataframe
                 income_data = []
                 sorted_stmts = sorted(income_stmt, key=lambda x: x.get('date', ''))[-5:]  # Last 5 years
-                
+
                 for idx, stmt in enumerate(sorted_stmts):
                     year = stmt.get('date', '').split('-')[0]
                     revenue = stmt.get('revenue', 0)
-                    
+
                     # Calculate revenue growth from previous year
                     if idx == 0:
                         revenue_growth = "—"
@@ -3266,7 +3365,7 @@ if page == "📄 Company Dossier":
                             revenue_growth = f"{rev_growth_pct:.1f}%"
                         else:
                             revenue_growth = "—"
-                    
+
                     gross_profit = stmt.get('grossProfit', 0)
                     gross_margin = (gross_profit / revenue * 100) if revenue > 0 else 0
                     operating_income = stmt.get('operatingIncome', 0)
@@ -3274,7 +3373,7 @@ if page == "📄 Company Dossier":
                     net_income = stmt.get('netIncome', 0)
                     net_margin = (net_income / revenue * 100) if revenue > 0 else 0
                     eps = stmt.get('eps', 0)
-                    
+
                     income_data.append({
                         'Year': year,
                         'Revenue ($B)': f"${revenue/1e9:.1f}B" if revenue else "—",
@@ -3287,22 +3386,22 @@ if page == "📄 Company Dossier":
                         'Net Margin %': f"{net_margin:.1f}%" if net_margin > 0 else "—",
                         'EPS': f"${eps:.2f}" if eps else "—"
                     })
-                
+
                 df_income = pd.DataFrame(income_data)
                 st.dataframe(df_income, use_container_width=True, hide_index=True)
                 st.caption("💡 Look for: Growing revenue, stable margins, improving earnings")
             else:
                 st.warning("Income statement data not available")
-            
+
             st.markdown("---")
-            
+
             # ═══════════════════════════════════════════════════════════════════════════════
             # TABLE 2: CASH FLOW STATEMENT (5 YEARS)
             # ═══════════════════════════════════════════════════════════════════════════════
-            
+
             if cashflow_stmt and isinstance(cashflow_stmt, list) and len(cashflow_stmt) > 0:
                 st.subheader("💰 Cash Flow Statement (5 Years)")
-                
+
                 # Build cash flow dataframe
                 cashflow_data = []
                 for stmt in sorted(cashflow_stmt, key=lambda x: x.get('date', ''))[-5:]:
@@ -3312,7 +3411,7 @@ if page == "📄 Company Dossier":
                     free_cf = stmt.get('freeCashFlow', 0)
                     revenue = stmt.get('operatingCashFlow', 0)  # Use OCF as proxy
                     fcf_margin = (free_cf / revenue * 100) if revenue > 0 else 0
-                    
+
                     cashflow_data.append({
                         'Year': year,
                         'Operating Cash Flow ($B)': f"${operating_cf/1e9:.1f}B" if operating_cf else "—",
@@ -3320,22 +3419,22 @@ if page == "📄 Company Dossier":
                         'Free Cash Flow ($B)': f"${free_cf/1e9:.1f}B" if free_cf else "—",
                         'FCF Margin %': f"{fcf_margin:.1f}%" if fcf_margin > 0 else "—"
                     })
-                
+
                 df_cashflow = pd.DataFrame(cashflow_data)
                 st.dataframe(df_cashflow, use_container_width=True, hide_index=True)
                 st.caption("💡 Look for: Growing free cash flow, low capex relative to revenue")
             else:
                 st.warning("Cash flow statement data not available")
-            
+
             st.markdown("---")
-            
+
             # ═══════════════════════════════════════════════════════════════════════════════
             # TABLE 3: BALANCE SHEET & CAPITAL STRUCTURE (5 YEARS)
             # ═══════════════════════════════════════════════════════════════════════════════
-            
+
             if balance_sheet and isinstance(balance_sheet, list) and len(balance_sheet) > 0:
                 st.subheader("⚖️ Balance Sheet & Capital Structure (5 Years)")
-                
+
                 # Build balance sheet dataframe
                 balance_data = []
                 for stmt in sorted(balance_sheet, key=lambda x: x.get('date', ''))[-5:]:
@@ -3345,7 +3444,7 @@ if page == "📄 Company Dossier":
                     net_debt = total_debt - cash
                     equity = stmt.get('totalStockholdersEquity', 0)
                     debt_equity = (total_debt / equity) if equity > 0 else 0
-                    
+
                     balance_data.append({
                         'Year': year,
                         'Cash ($B)': f"${cash/1e9:.1f}B" if cash else "—",
@@ -3354,36 +3453,36 @@ if page == "📄 Company Dossier":
                         'Shareholders Equity ($B)': f"${equity/1e9:.1f}B" if equity else "—",
                         'Debt/Equity Ratio': f"{debt_equity:.2f}" if debt_equity >= 0 else "—"
                     })
-                
+
                 df_balance = pd.DataFrame(balance_data)
                 st.dataframe(df_balance, use_container_width=True, hide_index=True)
                 st.caption("💡 Look for: Strong cash position, low debt, improving equity")
             else:
                 st.warning("Balance sheet data not available")
-            
+
             st.markdown("---")
-            
+
             # ═══════════════════════════════════════════════════════════════════════════════
             # KEY FINANCIAL INSIGHTS
             # ═══════════════════════════════════════════════════════════════════════════════
-            
+
             st.subheader("🎯 Key Financial Insights")
-            
+
             insights = []
-            
+
             # Analyze income statement trends
             if income_stmt and len(income_stmt) >= 2:
                 latest_revenue = income_stmt[0].get('revenue', 0)
                 prev_revenue = income_stmt[1].get('revenue', 0) if len(income_stmt) > 1 else latest_revenue
                 rev_trend = ((latest_revenue - prev_revenue) / prev_revenue * 100) if prev_revenue > 0 else 0
-                
+
                 if rev_trend > 10:
                     insights.append("✅ **Strong Revenue Growth**: >10% YoY indicates healthy demand")
                 elif rev_trend > 0:
                     insights.append("✅ **Positive Revenue Growth**: Growing steadily")
                 else:
                     insights.append("⚠️ **Declining Revenue**: Watch for headwinds")
-            
+
             # Analyze cash flow
             if cashflow_stmt and len(cashflow_stmt) >= 1:
                 latest_fcf = cashflow_stmt[0].get('freeCashFlow', 0)
@@ -3391,30 +3490,30 @@ if page == "📄 Company Dossier":
                     insights.append("✅ **Positive Free Cash Flow**: Company generates real cash")
                 else:
                     insights.append("⚠️ **Negative/Low FCF**: Watch cash burn rate")
-            
+
             # Analyze balance sheet
             if balance_sheet and len(balance_sheet) >= 1:
                 latest_cash = balance_sheet[0].get('cashAndCashEquivalents', 0)
                 latest_debt = balance_sheet[0].get('totalDebt', 0)
                 net_debt = latest_debt - latest_cash
-                
+
                 if net_debt < 0:
                     insights.append("✅ **Net Cash Position**: Company has more cash than debt")
                 elif net_debt < latest_cash:
                     insights.append("✅ **Manageable Debt**: Debt < Cash position")
                 else:
                     insights.append("⚠️ **High Leverage**: Debt exceeds cash, monitor closely")
-            
+
             for insight in insights:
                 st.write(insight)
-            
+
             if not insights:
                 st.info("💡 Load complete financial statements above for detailed analysis")
-            
+
         except Exception as e:
             st.warning(f"Could not fetch financial statements: {str(e)[:100]}")
             st.info("💡 This is normal if the API is rate-limited. Try again in a moment.")
-        
+
         st.markdown("---")
 
         # Generate dossier
@@ -3423,7 +3522,7 @@ if page == "📄 Company Dossier":
                 pdf_path = generate_dossier_pdf(dos_ticker, vd, v, result, checks, buff_score,
                                                cat, note, peg, moat_rat, moat_sc,
                                                cio_rec, inv_edge, risks)
-            
+
             with open(pdf_path, "rb") as f:
                 st.download_button(
                     label="📥 Download Dossier PDF",
@@ -3439,7 +3538,6 @@ if page == "📄 Company Dossier":
     else:
         st.markdown('<div class="info-box">Enter a ticker and click <b>Load</b> to start building a professional investment dossier.</div>',
                     unsafe_allow_html=True)
-
 
 # ═════════════════════════════════════════════
 # QUALITATIVE ALERT SYSTEM — engine
@@ -3596,226 +3694,8 @@ def run_alert_scan(tickers, news_days=30, insider_days=90, filing_days=60):
         out[tk] = entry
     return out
 
-# ═════════════════════════════════════════════
-# VALUATION ENGINE — DCF, Reverse DCF, Buffett,
-# Lynch classification, Moat assessment
-# ═════════════════════════════════════════════
-
-def fetch_valuation_data(ticker):
-    d = fetch_company(ticker)
-    if not d.get("ok"): return d
-    d["income6"]   = fmp_get("income-statement",     {"symbol": ticker, "period": "annual", "limit": 6})
-    d["cashflow6"] = fmp_get("cash-flow-statement",  {"symbol": ticker, "period": "annual", "limit": 6})
-    d["balance"]   = fmp_get("balance-sheet-statement", {"symbol": ticker, "period": "annual", "limit": 2})
-    q = fmp_get("quote", {"symbol": ticker})
-    d["quote"] = q[0] if isinstance(q, list) and q else {}
-    d["metrics6"]  = fmp_get("key-metrics", {"symbol": ticker, "period": "annual", "limit": 6})
-    return d
-
-def _val_inputs(d):
-    """Extract the raw numbers the valuation engine needs."""
-    v = {}
-    q   = d.get("quote", {})
-    bal = d.get("balance", []) or []
-    cf  = d.get("cashflow6", []) or []
-    inc = d.get("income6", []) or []
-    v["price"]  = float(q.get("price") or d.get("price") or 0)
-    v["shares"] = float(q.get("sharesOutstanding") or 0)
-    if not v["shares"] and v["price"] and d.get("mktcap"):
-        v["shares"] = d["mktcap"] / v["price"]
-    v["mktcap"] = float(q.get("marketCap") or d.get("mktcap") or 0)
-    b0 = bal[0] if bal else {}
-    cash = float(b0.get("cashAndShortTermInvestments") or b0.get("cashAndCashEquivalents") or 0)
-    debt = float(b0.get("totalDebt") or 0)
-    v["net_debt"] = debt - cash
-    # FCF history (oldest→newest)
-    fcf_hist = [float(y["freeCashFlow"]) for y in reversed(cf) if y.get("freeCashFlow") is not None]
-    v["fcf_hist"] = fcf_hist
-    ttm = d.get("ttm", {}) or {}
-    v["fcf0"] = float(ttm.get("freeCashFlowTTM") or (fcf_hist[-1] if fcf_hist else 0))
-    if not v["fcf0"] and fcf_hist: v["fcf0"] = fcf_hist[-1]
-    # historical growth rates
-    def cagr(series):
-        s = [x for x in series if x and x > 0]
-        if len(s) >= 3: return (s[-1]/s[0])**(1/(len(s)-1)) - 1
-        return None
-    v["fcf_cagr"] = cagr(fcf_hist)
-    revs = [float(y["revenue"]) for y in reversed(inc) if y.get("revenue")]
-    v["rev_hist"] = revs
-    v["rev_cagr"] = cagr(revs)
-    eps  = [float(y["eps"]) for y in reversed(inc) if y.get("eps") is not None]
-    v["eps_hist"] = eps
-    v["eps_cagr"] = cagr([e for e in eps if e > 0]) if any(e > 0 for e in eps) else None
-    v["ni_hist"]  = [float(y.get("netIncome") or 0) for y in reversed(inc)]
-    v["shares_hist"] = [float(y.get("weightedAverageShsOutDil") or y.get("weightedAverageShsOut") or 0)
-                        for y in reversed(inc)]
-    return v
-
-def dcf_equity_value(fcf0, g1, wacc, terminal_g, net_debt, fade_years=5, growth_years=5):
-    """Two-stage DCF: growth_years at g1, then linear fade to terminal_g, plus terminal value."""
-    if fcf0 <= 0 or wacc <= terminal_g: return None, []
-    flows, fcf = [], fcf0
-    for yr in range(1, growth_years + 1):
-        fcf *= (1 + g1); flows.append(fcf)
-    for i in range(1, fade_years + 1):
-        g = g1 + (terminal_g - g1) * i / fade_years
-        fcf *= (1 + g); flows.append(fcf)
-    pv = sum(f / (1 + wacc) ** (i + 1) for i, f in enumerate(flows))
-    tv = flows[-1] * (1 + terminal_g) / (wacc - terminal_g)
-    pv += tv / (1 + wacc) ** len(flows)
-    return pv - net_debt, flows
-
-def reverse_dcf(price, shares, fcf0, wacc, terminal_g, net_debt):
-    """Bisection: what growth rate is priced in at the current market price?"""
-    if fcf0 <= 0 or not shares or not price: return None
-    target = price * shares
-    lo, hi = -0.10, 0.60
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        ev, _ = dcf_equity_value(fcf0, mid, wacc, terminal_g, net_debt)
-        if ev is None: return None
-        if ev < target: lo = mid
-        else: hi = mid
-    return (lo + hi) / 2
-
-def buffett_test(d, v):
-    """10-point Buffett quality checklist on real data. Returns (checks, score, max)."""
-    checks = []
-    met  = d.get("metrics6", []) or []
-    rat  = d.get("ratios", []) or []
-    inc  = d.get("income6", []) or []
-    def add(name, ok, detail):
-        checks.append({"check": name, "ok": ok, "detail": detail})
-    # 1-2 ROIC level and consistency
-    roics = []
-    for y in met:
-        r = y.get("returnOnInvestedCapital") or y.get("roic")
-        if r is not None: roics.append(float(r) * 100)
-    add("ROIC ≥ 15% (latest)", bool(roics) and roics[0] >= 15,
-        f"{roics[0]:.1f}%" if roics else "n/a")
-    add("ROIC ≥ 12% every year (consistency)", bool(roics) and len(roics) >= 3 and min(roics[:5]) >= 12,
-        f"min {min(roics[:5]):.1f}% over {min(len(roics),5)} yrs" if roics else "n/a")
-    # 3 Gross margin
-    gm = None
-    for y in rat[:1]:
-        g = y.get("grossProfitMargin") or y.get("grossMargin")
-        if g is not None: gm = float(g) * 100
-    if gm is None and inc:
-        rev, gp = inc[0].get("revenue"), inc[0].get("grossProfit")
-        if rev and gp: gm = gp / rev * 100
-    add("Gross margin ≥ 40% (pricing power)", gm is not None and gm >= 40,
-        f"{gm:.1f}%" if gm is not None else "n/a")
-    # 4 Net margin
-    nm = None
-    if inc and inc[0].get("revenue"):
-        nm = float(inc[0].get("netIncome") or 0) / float(inc[0]["revenue"]) * 100
-    add("Net margin ≥ 15%", nm is not None and nm >= 15, f"{nm:.1f}%" if nm is not None else "n/a")
-    # 5 FCF margin
-    fm = None
-    if v["fcf_hist"] and v["rev_hist"]:
-        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
-    add("FCF margin ≥ 12%", fm is not None and fm >= 12, f"{fm:.1f}%" if fm is not None else "n/a")
-    # 6 Debt
-    de = d.get("metrics", [])
-    dv = None
-    for y in (de[:2] if isinstance(de, list) else []):
-        x = y.get("debtToEbitda") or y.get("netDebtToEBITDA")
-        if x is not None: dv = float(x); break
-    add("Debt/EBITDA ≤ 2.5x or net cash", dv is not None and dv <= 2.5,
-        f"{dv:.2f}x" if dv is not None else "n/a")
-    # 7 Revenue growth
-    add("Revenue CAGR ≥ 8%", v["rev_cagr"] is not None and v["rev_cagr"] >= 0.08,
-        f"{v['rev_cagr']*100:.1f}%" if v["rev_cagr"] is not None else "n/a")
-    # 8 EPS growth
-    add("EPS growing over 5 yrs", v["eps_cagr"] is not None and v["eps_cagr"] > 0,
-        f"{v['eps_cagr']*100:.1f}% CAGR" if v["eps_cagr"] is not None else "n/a")
-    # 9 Share count
-    sh = [s for s in v["shares_hist"] if s > 0]
-    add("Share count flat or shrinking (buybacks)", len(sh) >= 3 and sh[-1] <= sh[0] * 1.02,
-        f"{(sh[-1]/sh[0]-1)*100:+.1f}% over {len(sh)} yrs" if len(sh) >= 3 else "n/a")
-    # 10 FCF conversion
-    conv = None
-    if v["fcf_hist"] and v["ni_hist"] and v["ni_hist"][-1] > 0:
-        conv = v["fcf_hist"][-1] / v["ni_hist"][-1] * 100
-    add("FCF / Net Income ≥ 80% (earnings are real cash)", conv is not None and conv >= 80,
-        f"{conv:.0f}%" if conv is not None else "n/a")
-    score = sum(1 for c in checks if c["ok"])
-    return checks, score, len(checks)
-
-def lynch_classify(d, v, pe):
-    """Peter Lynch category + PEG verdict."""
-    g = v["eps_cagr"] if v["eps_cagr"] is not None else v["rev_cagr"]
-    g_pct = g * 100 if g is not None else None
-    mktcap = v["mktcap"]
-    sector = d.get("sector", "")
-    cyclical_sectors = ["Energy", "Basic Materials", "Consumer Cyclical", "Industrials", "Materials"]
-    eps = v["eps_hist"]
-    if eps and eps[-1] < 0 and len(eps) >= 2 and max(eps) > 0:
-        cat, note = "Turnaround", "Earnings currently negative after being positive — thesis depends on recovery, size positions small."
-    elif g_pct is None:
-        cat, note = "Unclassified", "Not enough growth history to classify."
-    elif g_pct >= 20:
-        cat, note = "Fast Grower", "Lynch's favourite — 20%+ growers. Watch for the growth fade; pay up only with a reasonable PEG."
-    elif g_pct >= 10:
-        cat = "Stalwart" if mktcap > 10e9 else "Mid-pace Grower"
-        note = "Solid 10-20% grower. Lynch expects 30-50% gains then rotate — do not expect a ten-bagger."
-    elif sector in cyclical_sectors:
-        cat, note = "Cyclical", "Earnings follow the economic cycle — low P/E can be a TOP not a bottom. Time the cycle, not the P/E."
-    else:
-        cat, note = "Slow Grower", "Sub-10% growth — only interesting for dividends. Rarely a fit for MCIS Tier 1."
-    peg = None
-    if pe and g_pct and g_pct > 0:
-        peg = pe / g_pct
-    if peg is None:            peg_verdict = "PEG unavailable"
-    elif peg <= 1.0:           peg_verdict = "PEG ≤ 1.0 — attractively priced for its growth (Lynch buy zone)"
-    elif peg <= 1.5:           peg_verdict = "PEG 1.0-1.5 — fairly priced"
-    elif peg <= 2.0:           peg_verdict = "PEG 1.5-2.0 — expensive, needs execution"
-    else:                      peg_verdict = "PEG > 2.0 — priced for perfection"
-    return cat, note, peg, peg_verdict, g_pct
-
-def moat_assessment(d, v):
-    """Quantitative moat evidence score 0-10 → None / Narrow / Wide."""
-    ev, score = [], 0
-    rat = d.get("ratios", []) or []
-    gms = []
-    for y in rat:
-        g = y.get("grossProfitMargin") or y.get("grossMargin")
-        if g is not None: gms.append(float(g) * 100)
-    if gms:
-        avg = sum(gms) / len(gms)
-        if avg >= 50: score += 2; ev.append(f"🟢 Avg gross margin {avg:.0f}% — strong pricing power (+2)")
-        elif avg >= 35: score += 1; ev.append(f"🟡 Avg gross margin {avg:.0f}% — decent (+1)")
-        else: ev.append(f"🔴 Avg gross margin {avg:.0f}% — weak pricing power (+0)")
-        if len(gms) >= 3 and (max(gms) - min(gms)) <= 6:
-            score += 1; ev.append(f"🟢 Margin stability — range only {max(gms)-min(gms):.1f} pts (+1)")
-    met = d.get("metrics6", []) or []
-    roics = [float(y.get("returnOnInvestedCapital") or y.get("roic") or 0) * 100
-             for y in met if (y.get("returnOnInvestedCapital") or y.get("roic")) is not None]
-    if roics:
-        if min(roics[:5]) >= 15 and len(roics) >= 3:
-            score += 3; ev.append(f"🟢 ROIC ≥ 15% every year for {min(len(roics),5)} yrs — durable advantage (+3)")
-        elif roics[0] >= 15:
-            score += 2; ev.append(f"🟡 ROIC {roics[0]:.0f}% now but not consistently (+2)")
-        elif roics[0] >= 10:
-            score += 1; ev.append(f"🟡 ROIC {roics[0]:.0f}% — average business (+1)")
-        else:
-            ev.append(f"🔴 ROIC {roics[0]:.0f}% — no evidence of moat (+0)")
-    if v["fcf_hist"] and v["rev_hist"]:
-        fm = v["fcf_hist"][-1] / v["rev_hist"][-1] * 100
-        if fm >= 20: score += 2; ev.append(f"🟢 FCF margin {fm:.0f}% — cash machine (+2)")
-        elif fm >= 10: score += 1; ev.append(f"🟡 FCF margin {fm:.0f}% (+1)")
-        else: ev.append(f"🔴 FCF margin {fm:.0f}% (+0)")
-    if v["rev_cagr"] is not None and v["rev_cagr"] >= 0.10:
-        score += 2; ev.append(f"🟢 Revenue compounding at {v['rev_cagr']*100:.0f}% — moat is widening, not just defending (+2)")
-    rating = "WIDE MOAT" if score >= 8 else ("NARROW MOAT" if score >= 5 else "NO MOAT EVIDENCE")
-    return rating, score, ev
-
 # ─────────────────────────────────────────────
-# PAGE: VALUATION ENGINE
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-# PHASE 3: ETF OPPORTUNITY MONITOR
+# PAGE: ETF Monitor
 # ─────────────────────────────────────────────
 if page == "📈 ETF Monitor":
     st.markdown("""
@@ -3935,6 +3815,10 @@ if page == "📈 ETF Monitor":
         st.markdown("---")
         st.caption("⏰ Quarterly reminder: Re-run this scan in Jan / Apr / Jul / Oct — or anytime on demand.")
 
+# ─────────────────────────────────────────────
+# PAGE: VALUATION ENGINE
+# ─────────────────────────────────────────────
+
 if page == "🏛 Valuation Engine":
     st.markdown("""
     <div class="mcis-header">
@@ -3947,7 +3831,7 @@ if page == "🏛 Valuation Engine":
     with c1:
         # Get available tickers from scan results
         available_tickers = sorted(set([r["ticker"] for r in st.session_state.scan_results]))
-        
+
         if available_tickers:
             val_ticker = st.selectbox(
                 "Select company or type ticker",
@@ -3960,7 +3844,7 @@ if page == "🏛 Valuation Engine":
         else:
             val_ticker = st.text_input("Ticker symbol", placeholder="e.g. NVDA", key="val_ticker_in").upper().strip()
             st.caption("💡 Run the Scanner first to populate the dropdown")
-    
+
     with c2:
         st.markdown("<br>", unsafe_allow_html=True)
         load = st.button("📥 Load Company")
@@ -3983,6 +3867,16 @@ if page == "🏛 Valuation Engine":
         st.subheader(f"{vd['ticker']} — {vd.get('name','')}")
         st.caption(f"{vd.get('sector','')} | {vd.get('industry','')} | Price ${v['price']:,.2f} | "
                    f"Mkt Cap {fmt_mktcap(v['mktcap'])} | MCIS Score {result['score']}/100 ({result['verdict']})")
+
+        # ★ MCIS v1.1: show conversion note for foreign filers
+        try:
+            _cf6 = vd.get("cashflow6", []) or []
+            _ccy = _cf6[0].get("reportedCurrency", "USD") if _cf6 and isinstance(_cf6[0], dict) else "USD"
+            if _ccy != "USD":
+                st.info(f"💱 {vd['ticker']} reports in **{_ccy}** — all cash flows below are converted to USD "
+                        f"(rate: 1 {_ccy} = {get_fx_to_usd(_ccy):.4f} USD) so the DCF matches the USD share price.")
+        except Exception:
+            pass
 
         if v["fcf0"] <= 0:
             st.markdown('<div class="warning-box"><b>FCF is negative or unavailable</b> — a DCF is not meaningful. '
@@ -4050,6 +3944,11 @@ if page == "🏛 Valuation Engine":
 
             base_ps = per_share["⚖️ Base"]
             base_mos = (1 - v["price"] / base_ps) * 100 if base_ps > 0 else -999
+            # ★ MCIS v1.1 SANITY BREAKER
+            if base_ps > 0 and v["price"] > 0 and (base_ps > 3 * v["price"] or base_ps < 0.2 * v["price"]):
+                st.warning(f"⚠️ DATA CHECK — base case intrinsic value ${base_ps:,.0f} is wildly detached from "
+                           f"price ${v['price']:,.2f}. This usually means a currency, share-count, or stale-FCF "
+                           "problem. Verify inputs before trusting any signal below.")
             if base_mos >= mos_req:
                 st.success(f"✅ BUY ZONE — base case margin of safety {base_mos:.0f}% meets your {mos_req}% requirement. "
                            f"Buy-below price: ${base_ps*(1-mos_req/100):,.2f}")
@@ -4271,7 +4170,7 @@ if page == "🔬 Data Audit":
         # Summary cards
         passed = sum(1 for r in results.values() if r.get("status") == "✅ MATCH")
         flagged = sum(1 for r in results.values() if r.get("status") == "⚠️ REVIEW")
-        
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f'<div class="metric-card tier1-card"><div class="metric-value" style="color:#1b5e20">{passed}</div><div class="metric-label">✅ Data Matches Yahoo</div></div>', unsafe_allow_html=True)
@@ -4279,11 +4178,11 @@ if page == "🔬 Data Audit":
             st.markdown(f'<div class="metric-card tier3-card"><div class="metric-value" style="color:#e65100">{flagged}</div><div class="metric-label">⚠️ Minor Discrepancies</div></div>', unsafe_allow_html=True)
 
         st.markdown('<div class="section-header">📋 Detailed Audit Results</div>', unsafe_allow_html=True)
-        
+
         for ticker in sample_tickers:
             audit = results.get(ticker, {})
             status = audit.get("status", "⚠️ REVIEW")
-            
+
             with st.expander(f"{status} — {ticker}"):
                 if "error" in audit:
                     st.error(f"Error: {audit['error']}")
@@ -4293,7 +4192,7 @@ if page == "🔬 Data Audit":
                         st.success("✓ Data Matches:")
                         for metric, comparison in audit["matches"].items():
                             st.write(f"  • {metric.upper()}: {comparison}")
-                    
+
                     # Discrepancies
                     if audit.get("discrepancies"):
                         st.warning("⚠️ Discrepancies Found:")
